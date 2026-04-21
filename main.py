@@ -2,6 +2,7 @@ import time
 import os
 import secrets
 
+import stripe
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -16,6 +17,7 @@ from core.auth import (
 from core.proxy import forward_request
 from core.limiter import limiter
 from core.logger import build_stats, log_request
+from core.stripe_webhooks import StripeWebhookConfigError, construct_event, process_event
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
@@ -173,6 +175,60 @@ async def stats(request: Request):
     if not _is_stats_authorized(request):
         return JSONResponse({"detail": "Forbidden"}, status_code=403)
     return build_stats(active_keys=count_active_keys())
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+
+    try:
+        event = construct_event(payload, signature)
+    except StripeWebhookConfigError as exc:
+        log_request(
+            "/webhooks/stripe",
+            503,
+            0,
+            gateway="stripe",
+            event="stripe_config_error",
+            level="ERROR",
+        )
+        return JSONResponse({"detail": str(exc)}, status_code=503)
+    except ValueError:
+        log_request(
+            "/webhooks/stripe",
+            400,
+            0,
+            gateway="stripe",
+            event="stripe_invalid_payload",
+            level="WARNING",
+        )
+        return JSONResponse({"detail": "Invalid Stripe payload"}, status_code=400)
+    except stripe.error.SignatureVerificationError:
+        log_request(
+            "/webhooks/stripe",
+            400,
+            0,
+            gateway="stripe",
+            event="stripe_signature_failed",
+            level="WARNING",
+        )
+        return JSONResponse({"detail": "Invalid Stripe signature"}, status_code=400)
+
+    try:
+        result = process_event(event)
+    except Exception as exc:
+        log_request(
+            "/webhooks/stripe",
+            500,
+            0,
+            gateway="stripe",
+            event="stripe_processing_error",
+            level="ERROR",
+        )
+        return JSONResponse({"detail": f"Stripe webhook processing failed: {exc}"}, status_code=500)
+
+    return result
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 

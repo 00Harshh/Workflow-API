@@ -203,6 +203,28 @@ def create_key(
     return record
 
 
+def find_key_by_stripe_subscription(subscription_id: str) -> dict | None:
+    for key_record in get_all_keys():
+        if key_record.get("stripe_subscription_id") == subscription_id:
+            return key_record
+    return None
+
+
+def revoke_key_by_stripe_subscription(subscription_id: str) -> bool:
+    config = load_config()
+    keys = config.get("keys") or []
+    before = len(keys)
+    config["keys"] = [
+        key_record
+        for key_record in keys
+        if key_record.get("stripe_subscription_id") != subscription_id
+    ]
+    if len(config["keys"]) < before:
+        save_config(config)
+        return True
+    return False
+
+
 def revoke_key(name: str) -> bool:
     """Removes all keys with the given name. Returns True if any were removed."""
     config = load_config()
