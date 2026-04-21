@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+FlowGate CLI
+Usage: python cli.py <command>
+"""
+
+import sys
+import subprocess
+import json
+import os
+import time
+from collections import deque
+from pathlib import Path
+
+import click
+import yaml
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich import box
+from rich.prompt import Prompt, Confirm
+
+from core.auth import create_key, get_all_keys, is_key_expired, load_config, parse_expiration, revoke_key
+from core.logger import get_log_path, level_for_status
+
+console = Console()
+CONFIG_PATH = Path("config.yaml")
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def print_banner():
+    console.print()
+    console.print(Panel.fit(
+        "[bold white]FlowGate[/bold white]  [dim]— turn any workflow into an API[/dim]",
+        border_style="dim"
+    ))
+    console.print()
+
+
+def config_exists() -> bool:
+    return CONFIG_PATH.exists()
+
+
+def require_config():
+    if not config_exists():
+        console.print("[red]✗[/red] No config.yaml found. Run [bold]python cli.py init[/bold] first.")
+        sys.exit(1)
+
+
+def _format_expiration(key_record: dict) -> str:
+    expires_at = key_record.get("expires_at")
+    if not expires_at:
+        return "Never"
+    if is_key_expired(key_record):
+        return f"Expired ({expires_at})"
+    return str(expires_at)
+
+
+def _log_line_level(line: str) -> str | None:
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    level = entry.get("level")
+    if level:
+        return str(level).upper()
+
+    status = entry.get("status")
+    if isinstance(status, int):
+        return level_for_status(status)
+    return None
+
+
+def _matches_log_level(line: str, level: str | None) -> bool:
+    if not level:
+        return True
+    return _log_line_level(line) == level.upper()
+
+
+def _print_log_line(line: str):
+    click.echo(line.rstrip("\n"))
+
+
+def _tail_log_file(path: Path, lines: int, level: str | None):
+    matches = deque(maxlen=lines)
+    with open(path, "r") as f:
+        for line in f:
+            if _matches_log_level(line, level):
+                matches.append(line)
+
+    for line in matches:
+        _print_log_line(line)
+
+
+def _follow_log_file(path: Path, level: str | None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+
+    with open(path, "r") as f:
+        f.seek(0, os.SEEK_END)
+        while True:
+            line = f.readline()
+            if line:
+                if _matches_log_level(line, level):
+                    _print_log_line(line)
+                continue
+            time.sleep(0.5)
+
+
+# ── CLI root ────────────────────────────────────────────────────────────────────
+
+@click.group()
+def cli():
+    """FlowGate — API layer for your workflows."""
+    pass
+
+
+# ── init ───────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def init():
+    """Interactive setup wizard. Run this first."""
+    print_banner()
+    console.print("[bold]Setup wizard[/bold]\n")
+
+    if config_exists():
+        overwrite = Confirm.ask("[yellow]config.yaml already exists. Overwrite?[/yellow]", default=False)
+        if not overwrite:
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    # Collect workflows
+    workflows = []
+    console.print("[dim]Add your workflow(s). Press enter to skip optional fields.[/dim]\n")
+
+    while True:
+        name = Prompt.ask("[cyan]Workflow name[/cyan] (e.g. summarize)")
+        target = Prompt.ask("[cyan]Webhook / target URL[/cyan] (e.g. http://localhost:5678/webhook/abc)")
+        endpoint = Prompt.ask(
+            "[cyan]Endpoint path[/cyan]",
+            default=f"/run/{name.lower().replace(' ', '-')}"
+        )
+        method = Prompt.ask("[cyan]HTTP method[/cyan]", default="POST").upper()
+
+        workflows.append({
+            "name": name,
+            "endpoint": endpoint,
+            "target": target,
+            "method": method,
+        })
+
+        console.print()
+        another = Confirm.ask("Add another workflow?", default=False)
+        if not another:
+            break
+        console.print()
+
+    # Server config
+    console.print()
+    port = int(Prompt.ask("[cyan]Port[/cyan]", default="8000"))
+
+    config = {
+        "workflows": workflows,
+        "keys": [],
+        "logging": {
+            "file": "logs/usage.log",
+        },
+        "server": {
+            "host": "0.0.0.0",
+            "port": port,
+        }
+    }
+
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    console.print()
+    console.print("[green]✓[/green] config.yaml created\n")
+
+    # Offer to create first key
+    create_first = Confirm.ask("Create your first API key now?", default=True)
+    if create_first:
+        console.print()
+        _create_key_interactive()
+
+    console.print()
+    console.print(Panel(
+        "[bold]You're ready.[/bold]\n\n"
+        "  Start the server:   [cyan]python cli.py start[/cyan]\n"
+        "  Manage keys:        [cyan]python cli.py keys[/cyan]\n"
+        "  View status:        [cyan]python cli.py status[/cyan]",
+        border_style="green",
+        expand=False
+    ))
+    console.print()
+
+
+# ── start ──────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--port", default=None, type=int, help="Override port from config")
+def start(port):
+    """Start the API server."""
+    require_config()
+
+    cfg = load_config()
+    keys = cfg.get("keys") or []
+    workflows = cfg.get("workflows") or []
+
+    console.print()
+    console.print(Panel.fit(
+        "[bold white]FlowGate[/bold white] starting...",
+        border_style="dim"
+    ))
+
+    if not keys:
+        console.print()
+        console.print("[yellow]⚠[/yellow]  No API keys found.")
+        console.print('   Create one: [cyan]python cli.py keys create[/cyan]\n')
+
+    console.print()
+    for wf in workflows:
+        console.print(f"  [green]→[/green] [bold]{wf['endpoint']}[/bold]  [dim]→  {wf['target']}[/dim]")
+
+    server_port = port or cfg.get("server", {}).get("port", 8000)
+    console.print()
+    console.print(f"  [dim]Listening on[/dim] http://0.0.0.0:{server_port}")
+    console.print(f"  [dim]Docs:[/dim]          http://localhost:{server_port}/docs")
+    console.print()
+
+    # Hand off to uvicorn
+    subprocess.run([sys.executable, "main.py"])
+
+
+# ── status ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def status():
+    """Show current config and active keys."""
+    require_config()
+    print_banner()
+
+    cfg = load_config()
+    workflows = cfg.get("workflows") or []
+    keys = cfg.get("keys") or []
+    server = cfg.get("server", {})
+
+    # Workflows table
+    wf_table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
+    wf_table.add_column("Name",     style="bold")
+    wf_table.add_column("Endpoint", style="cyan")
+    wf_table.add_column("Target",   style="dim")
+    wf_table.add_column("Method",   style="dim")
+
+    for wf in workflows:
+        wf_table.add_row(wf["name"], wf["endpoint"], wf["target"], wf.get("method", "POST"))
+
+    console.print("[bold]Workflows[/bold]")
+    if workflows:
+        console.print(wf_table)
+    else:
+        console.print("  [dim]None. Run python cli.py init[/dim]\n")
+
+    # Keys table
+    key_table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
+    key_table.add_column("Name",       style="bold")
+    key_table.add_column("Rate limit", style="cyan")
+    key_table.add_column("Expires",    style="yellow")
+    key_table.add_column("Created",    style="dim")
+    key_table.add_column("Key prefix", style="dim")
+
+    for k in keys:
+        rpm = k.get("rate_limit_per_minute", 60)
+        limit_str = f"{rpm} req/min" if rpm > 0 else "Unlimited"
+        key_table.add_row(k["name"], limit_str, _format_expiration(k), k.get("created_at", "-"), k["key"][:22] + "...")
+
+    console.print("[bold]API Keys[/bold]")
+    if keys:
+        console.print(key_table)
+    else:
+        console.print("  [dim]None. Run python cli.py keys create[/dim]\n")
+
+    console.print(f"[bold]Server[/bold]  [dim]port {server.get('port', 8000)}[/dim]\n")
+
+
+# ── logs ───────────────────────────────────────────────────────────────────────
+
+@cli.command("logs")
+@click.option("--follow", "-f", is_flag=True, help="Stream new log entries as they are written.")
+@click.option("--level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), help="Only show logs with this severity.")
+@click.option("--lines", default=20, show_default=True, type=int, help="Number of matching log lines to print before exiting or following.")
+def logs(follow, level, lines):
+    """Show FlowGate access logs."""
+    log_path = get_log_path()
+    normalized_level = level.upper() if level else None
+
+    if not log_path.exists() and not follow:
+        console.print(f"[yellow]No log file found at {log_path}[/yellow]")
+        return
+
+    if lines > 0 and log_path.exists():
+        _tail_log_file(log_path, lines, normalized_level)
+
+    if follow:
+        _follow_log_file(log_path, normalized_level)
+
+
+# ── keys group ─────────────────────────────────────────────────────────────────
+
+@cli.group()
+def keys():
+    """Manage API keys."""
+    pass
+
+
+def _create_key_interactive(name=None, rate_limit=None, expires_at=None, expires_in=None):
+    if not name:
+        name = Prompt.ask("[cyan]Key name / tier[/cyan] (e.g. Free, Pro, Enterprise)")
+    if rate_limit is None:
+        rate_input = Prompt.ask("[cyan]Rate limit (requests/min)[/cyan]  [dim]0 = unlimited[/dim]", default="60")
+        rate_limit = int(rate_input)
+
+    try:
+        parsed_expires_at = parse_expiration(expires_at=expires_at, expires_in=expires_in)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    record = create_key(name=name, rate_limit_per_minute=rate_limit, expires_at=parsed_expires_at)
+
+    limit_str = f"{rate_limit} req/min" if rate_limit > 0 else "Unlimited"
+    expires_str = parsed_expires_at or "Never"
+    console.print()
+    console.print(Panel(
+        f"[bold green]Key created[/bold green]\n\n"
+        f"  Name        [cyan]{record['name']}[/cyan]\n"
+        f"  Rate limit  [cyan]{limit_str}[/cyan]\n"
+        f"  Expires     [cyan]{expires_str}[/cyan]\n"
+        f"  Key         [bold yellow]{record['key']}[/bold yellow]\n\n"
+        f"[dim]Share this key with your user. It won't be shown again.[/dim]",
+        border_style="green",
+        expand=False
+    ))
+
+
+@keys.command("create")
+@click.option("--name", help="Name/tier for this key, for example Free or Pro.")
+@click.option("--rate-limit", type=int, help="Requests per minute. Use 0 for unlimited.")
+@click.option("--expires-in", help="Relative expiration, for example 30d, +30d, 12h, or 45m.")
+@click.option("--expires-at", help="Absolute expiration, for example 2026-12-31 or 2026-12-31T23:59:59Z.")
+def keys_create(name, rate_limit, expires_in, expires_at):
+    """Generate a new API key with a custom rate limit."""
+    require_config()
+    console.print()
+    _create_key_interactive(name=name, rate_limit=rate_limit, expires_at=expires_at, expires_in=expires_in)
+    console.print()
+
+
+@keys.command("list")
+def keys_list():
+    """List all active API keys."""
+    require_config()
+
+    all_keys = get_all_keys()
+    console.print()
+
+    if not all_keys:
+        console.print("  [dim]No keys yet. Run:[/dim] [cyan]python cli.py keys create[/cyan]\n")
+        return
+
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
+    table.add_column("Name",        style="bold")
+    table.add_column("Rate limit",  style="cyan")
+    table.add_column("Expires",     style="yellow")
+    table.add_column("Created",     style="dim")
+    table.add_column("Key",         style="dim")
+
+    for k in all_keys:
+        rpm = k.get("rate_limit_per_minute", 60)
+        limit_str = f"{rpm} req/min" if rpm > 0 else "Unlimited"
+        table.add_row(k["name"], limit_str, _format_expiration(k), k.get("created_at", "-"), k["key"][:28] + "...")
+
+    console.print(table)
+
+
+@keys.command("revoke")
+@click.argument("name")
+def keys_revoke(name):
+    """Revoke all keys with the given name."""
+    require_config()
+    console.print()
+
+    confirm = Confirm.ask(f"[yellow]Revoke all keys named '{name}'?[/yellow]")
+    if not confirm:
+        console.print("[dim]Aborted.[/dim]\n")
+        return
+
+    if revoke_key(name):
+        console.print(f"[green]✓[/green] Revoked keys named '[bold]{name}[/bold]'\n")
+    else:
+        console.print(f"[red]✗[/red] No keys found with name '[bold]{name}[/bold]'\n")
+
+
+# Singular alias: `python cli.py key create` works the same as `python cli.py keys create`.
+cli.add_command(keys, "key")
+
+
+# ── entry ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    cli()

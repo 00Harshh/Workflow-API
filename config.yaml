@@ -1,0 +1,19 @@
+workflows:
+- name: my-workflow
+  endpoint: /run/my-workflow
+  target: http://localhost:5678/webhook/your-webhook-id
+  method: POST
+keys:
+- name: Pro
+  key: wfapi-kpS6024dLBDhglYsANZ4VW9jw0-YcNIiYOUn-aweqeg
+  rate_limit_per_minute: 100
+  created_at: '2026-04-21'
+- name: Enterprise
+  key: wfapi-_CyZQ78zMNCsBcDdsDWNXJ_vG5CGcO2HiIDnBPGn74I
+  rate_limit_per_minute: 0
+  created_at: '2026-04-21'
+logging:
+  file: logs/usage.log
+server:
+  port: 8000
+  host: 0.0.0.0
