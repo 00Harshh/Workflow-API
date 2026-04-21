@@ -69,6 +69,16 @@ If you do not add the alias, use `python3 cli.py` anywhere this README shows `fl
 
 ## 2. Create Your First Gateway
 
+For n8n, the easiest path is the one-command setup:
+
+```bash
+python3 cli.py n8n --url http://localhost:5678/webhook-test/n8ntest2 --name n8ntest --force
+```
+
+This writes `config.yaml`, creates a scoped test API key, and prints the exact `curl` command to test your FlowGate endpoint.
+
+If you want the step-by-step wizard instead, run:
+
 Run the setup wizard:
 
 ```bash

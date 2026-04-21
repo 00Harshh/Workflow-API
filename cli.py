@@ -58,6 +58,94 @@ def require_config():
         sys.exit(1)
 
 
+def _slugify(value: str) -> str:
+    slug = value.strip().lower().replace(" ", "-")
+    return "".join(ch for ch in slug if ch.isalnum() or ch == "-").strip("-") or "workflow"
+
+
+def _normalize_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if not endpoint:
+        raise ValueError("Endpoint path cannot be empty.")
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+    return endpoint
+
+
+def _prompt_required(label: str, default: str | None = None) -> str:
+    while True:
+        value = Prompt.ask(label, default=default).strip()
+        if value:
+            return value
+        console.print("[red]Please enter a value. Blank values are not valid here.[/red]")
+
+
+def _prompt_port(default: int = 8000) -> int:
+    while True:
+        value = Prompt.ask("[cyan]Port[/cyan]", default=str(default)).strip()
+        try:
+            port = int(value)
+        except ValueError:
+            console.print("[red]Port must be a number, for example 8000. Do not paste commands here.[/red]")
+            continue
+        if 1 <= port <= 65535:
+            return port
+        console.print("[red]Port must be between 1 and 65535.[/red]")
+
+
+def _base_config(workflows: list[dict], port: int) -> dict:
+    return {
+        "workflows": workflows,
+        "keys": [],
+        "logging": {
+            "file": "logs/usage.log",
+        },
+        "stripe": {
+            "webhook_secret": None,
+            "api_key": None,
+            "price_to_gateway": {},
+        },
+        "server": {
+            "host": "0.0.0.0",
+            "port": port,
+        },
+    }
+
+
+def _print_key_created(record: dict, rate_limit: int, expires_at: str | None, allowed_gateways: list[str] | None):
+    limit_str = f"{rate_limit} req/min" if rate_limit > 0 else "Unlimited"
+    expires_str = expires_at or "Never"
+    scope_str = ", ".join(allowed_gateways) if allowed_gateways else "All gateways"
+    console.print()
+    console.print(Panel(
+        f"[bold green]Key created[/bold green]\n\n"
+        f"  Name        [cyan]{record['name']}[/cyan]\n"
+        f"  Rate limit  [cyan]{limit_str}[/cyan]\n"
+        f"  Scope       [cyan]{scope_str}[/cyan]\n"
+        f"  Expires     [cyan]{expires_str}[/cyan]\n"
+        f"  Key         [bold yellow]{record['key']}[/bold yellow]\n\n"
+        f"[dim]Share this key with your user. It won't be shown again.[/dim]",
+        border_style="green",
+        expand=False
+    ))
+
+
+def _print_next_steps(endpoint: str, key: str, port: int):
+    console.print()
+    console.print(Panel(
+        "[bold]Next steps[/bold]\n\n"
+        "1. Keep your n8n Webhook node on [cyan]Listen for test event[/cyan].\n"
+        f"2. Start FlowGate:\n   [cyan]python3 cli.py start[/cyan]\n\n"
+        "3. In a second terminal, test it:\n"
+        f"   [cyan]curl -X POST http://localhost:{port}{endpoint} \\\\[/cyan]\n"
+        f"   [cyan]  -H \"Authorization: Bearer {key}\" \\\\[/cyan]\n"
+        f"   [cyan]  -H \"Content-Type: application/json\" \\\\[/cyan]\n"
+        f"   [cyan]  -d '{{\"name\":\"Harsh\",\"test\":true}}'[/cyan]",
+        border_style="green",
+        expand=False,
+    ))
+
+
 def _format_expiration(key_record: dict) -> str:
     expires_at = key_record.get("expires_at")
     if not expires_at:
@@ -138,6 +226,59 @@ def cli():
     pass
 
 
+# ── n8n quick setup ───────────────────────────────────────────────────────────
+
+@cli.command("n8n")
+@click.option("--url", "webhook_url", help="Your n8n webhook URL, e.g. http://localhost:5678/webhook-test/n8ntest.")
+@click.option("--name", default="n8ntest", show_default=True, help="FlowGate workflow/gateway name.")
+@click.option("--endpoint", default=None, help="Public FlowGate endpoint. Defaults to /run/<name>.")
+@click.option("--port", default=8000, show_default=True, type=click.IntRange(1, 65535), help="FlowGate server port.")
+@click.option("--key-name", default="Test", show_default=True, help="Name for the generated API key.")
+@click.option("--rate-limit", default=60, show_default=True, type=int, help="Requests per minute for the generated key.")
+@click.option("--force", is_flag=True, help="Overwrite config.yaml without asking.")
+def setup_n8n(webhook_url, name, endpoint, port, key_name, rate_limit, force):
+    """One-command n8n setup. Creates config.yaml and a test API key."""
+    print_banner()
+    console.print("[bold]n8n quick setup[/bold]\n")
+
+    if config_exists() and not force:
+        overwrite = Confirm.ask("[yellow]config.yaml already exists. Overwrite it for this n8n setup?[/yellow]", default=False)
+        if not overwrite:
+            console.print("[dim]Aborted. Nothing changed.[/dim]")
+            return
+
+    if not webhook_url:
+        webhook_url = _prompt_required(
+            "[cyan]n8n webhook URL[/cyan]",
+            "http://localhost:5678/webhook-test/n8ntest",
+        )
+
+    if not webhook_url.startswith(("http://", "https://")):
+        raise click.ClickException("Webhook URL must start with http:// or https://")
+
+    workflow_name = _slugify(name)
+    endpoint_path = _normalize_endpoint(endpoint or f"/run/{workflow_name}")
+    workflows = [{
+        "name": workflow_name,
+        "endpoint": endpoint_path,
+        "target": webhook_url.strip(),
+        "method": "POST",
+    }]
+
+    save_config(_base_config(workflows, port))
+    record = create_key(
+        name=key_name,
+        rate_limit_per_minute=rate_limit,
+        expires_at=None,
+        allowed_gateways=[workflow_name],
+    )
+
+    console.print("[green]✓[/green] config.yaml created for n8n")
+    console.print(f"[green]✓[/green] Gateway: [bold]{endpoint_path}[/bold] → [dim]{webhook_url}[/dim]")
+    _print_key_created(record, rate_limit, None, [workflow_name])
+    _print_next_steps(endpoint_path, record["key"], port)
+
+
 # ── init ───────────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -157,12 +298,12 @@ def init():
     console.print("[dim]Add your workflow(s). Press enter to skip optional fields.[/dim]\n")
 
     while True:
-        name = Prompt.ask("[cyan]Workflow name[/cyan] (e.g. summarize)")
-        target = Prompt.ask("[cyan]Webhook / target URL[/cyan] (e.g. http://localhost:5678/webhook/abc)")
-        endpoint = Prompt.ask(
+        name = _prompt_required("[cyan]Workflow name[/cyan] (e.g. summarize)")
+        target = _prompt_required("[cyan]Webhook / target URL[/cyan] (e.g. http://localhost:5678/webhook/abc)")
+        endpoint = _normalize_endpoint(Prompt.ask(
             "[cyan]Endpoint path[/cyan]",
-            default=f"/run/{name.lower().replace(' ', '-')}"
-        )
+            default=f"/run/{_slugify(name)}"
+        ))
         method = Prompt.ask("[cyan]HTTP method[/cyan]", default="POST").upper()
 
         workflows.append({
@@ -180,21 +321,9 @@ def init():
 
     # Server config
     console.print()
-    port = int(Prompt.ask("[cyan]Port[/cyan]", default="8000"))
+    port = _prompt_port(default=8000)
 
-    config = {
-        "workflows": workflows,
-        "keys": [],
-        "logging": {
-            "file": "logs/usage.log",
-        },
-        "server": {
-            "host": "0.0.0.0",
-            "port": port,
-        }
-    }
-
-    save_config(config)
+    save_config(_base_config(workflows, port))
 
     console.print()
     console.print("[green]✓[/green] config.yaml created\n")
@@ -364,21 +493,7 @@ def _create_key_interactive(name=None, rate_limit=None, expires_at=None, expires
         allowed_gateways=allowed_gateways,
     )
 
-    limit_str = f"{rate_limit} req/min" if rate_limit > 0 else "Unlimited"
-    expires_str = parsed_expires_at or "Never"
-    scope_str = ", ".join(allowed_gateways) if allowed_gateways else "All gateways"
-    console.print()
-    console.print(Panel(
-        f"[bold green]Key created[/bold green]\n\n"
-        f"  Name        [cyan]{record['name']}[/cyan]\n"
-        f"  Rate limit  [cyan]{limit_str}[/cyan]\n"
-        f"  Scope       [cyan]{scope_str}[/cyan]\n"
-        f"  Expires     [cyan]{expires_str}[/cyan]\n"
-        f"  Key         [bold yellow]{record['key']}[/bold yellow]\n\n"
-        f"[dim]Share this key with your user. It won't be shown again.[/dim]",
-        border_style="green",
-        expand=False
-    ))
+    _print_key_created(record, rate_limit, parsed_expires_at, allowed_gateways)
 
 
 @keys.command("create")
