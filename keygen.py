@@ -8,12 +8,13 @@ Usage:
   python keygen.py --name "Enterprise" --rate-limit 1000
   python keygen.py --name "Unlimited"  --rate-limit 0
   python keygen.py --name "Trial" --rate-limit 30 --expires-in 7d
+  python keygen.py --name "Scoped" --rate-limit 30 --gateways my-workflow
   python keygen.py --revoke "Free"
 """
 
 import argparse
 import sys
-from core.auth import create_key, get_all_keys, parse_expiration, revoke_key
+from core.auth import create_key, get_all_keys, parse_allowed_gateways, parse_expiration, revoke_key
 
 
 def list_keys():
@@ -23,13 +24,14 @@ def list_keys():
         print('  python keygen.py --name "Free" --rate-limit 30\n')
         return
 
-    print(f"\n  {'NAME':<20} {'RATE LIMIT':<18} {'EXPIRES':<24} {'CREATED':<14} {'KEY'}")
-    print("  " + "-" * 108)
+    print(f"\n  {'NAME':<20} {'RATE LIMIT':<18} {'SCOPE':<24} {'EXPIRES':<24} {'CREATED':<14} {'KEY'}")
+    print("  " + "-" * 134)
     for k in keys:
         rpm = k.get("rate_limit_per_minute", 60)
         limit_str = f"{rpm} req/min" if rpm > 0 else "Unlimited"
+        scope = ", ".join(k.get("allowed_gateways") or []) or "All"
         expires_at = k.get("expires_at") or "Never"
-        print(f"  {k['name']:<20} {limit_str:<18} {expires_at:<24} {k.get('created_at', '-'):<14} {k['key'][:24]}...")
+        print(f"  {k['name']:<20} {limit_str:<18} {scope:<24} {expires_at:<24} {k.get('created_at', '-'):<14} {k['key'][:24]}...")
     print()
 
 
@@ -39,6 +41,7 @@ def main():
     parser.add_argument("--rate-limit", type=int, help="Requests per minute (0 = unlimited)")
     parser.add_argument("--expires-in", type=str, help="Relative expiration, e.g. 30d, +30d, 12h")
     parser.add_argument("--expires-at", type=str, help="Absolute expiration, e.g. 2026-12-31")
+    parser.add_argument("--gateways", "--scope", type=str, help="Comma-separated gateway names this key can access")
     parser.add_argument("--revoke",     type=str, help="Revoke all keys with this name")
     args = parser.parse_args()
 
@@ -65,6 +68,7 @@ def main():
 
     try:
         expires_at = parse_expiration(expires_at=args.expires_at, expires_in=args.expires_in)
+        allowed_gateways = parse_allowed_gateways(args.gateways)
     except ValueError as exc:
         print(f"  Error: {exc}")
         sys.exit(1)
@@ -73,6 +77,7 @@ def main():
         name=args.name,
         rate_limit_per_minute=args.rate_limit,
         expires_at=expires_at,
+        allowed_gateways=allowed_gateways,
     )
 
     rpm = record["rate_limit_per_minute"]
@@ -83,6 +88,7 @@ def main():
 
      Name       : {record['name']}
      Rate limit : {limit_str}
+     Scope      : {', '.join(record.get('allowed_gateways') or []) or 'All gateways'}
      Expires    : {record.get('expires_at') or 'Never'}
      Created    : {record['created_at']}
      Key        : {record['key']}
