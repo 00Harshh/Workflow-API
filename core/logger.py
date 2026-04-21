@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 from core.auth import load_config
@@ -100,3 +100,10 @@ def build_stats(active_keys: int) -> dict:
         "active_keys": active_keys,
         "rate_limited_requests": rate_limited_requests,
     }
+
+
+def recent_log_entries(limit: int = 10) -> list[dict]:
+    entries = deque(maxlen=limit)
+    for entry in iter_log_entries() or []:
+        entries.append(entry)
+    return list(entries)
