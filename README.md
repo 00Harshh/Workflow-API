@@ -45,6 +45,7 @@ python cli.py logs --follow     # Stream access logs live
 ```bash
 python cli.py keys create       # Generate a new key (name + rate limit)
 python cli.py keys create --name Trial --rate-limit 20 --expires-in 30d
+python cli.py keys create --name Pro --rate-limit 200 --gateways my-workflow
 python cli.py keys list         # List all active keys
 python cli.py keys revoke Pro   # Revoke all keys named 'Pro'
 ```
@@ -75,6 +76,41 @@ Each key gets its own isolated rate limit bucket. A Pro user hitting their limit
 
 User pays → you run `keys create` → send them the key → they're live.
 User cancels → `keys revoke` → key is dead instantly.
+
+---
+
+## Key Scoping
+
+By default, keys can call every configured workflow. Add `--gateways` to restrict a key to specific workflow/gateway names:
+
+```bash
+python cli.py keys create --name Basic --rate-limit 30 --gateways summarize,translate
+```
+
+Old keys without `allowed_gateways` continue to work for all workflows.
+
+---
+
+## Stripe Webhooks
+
+FlowGate can create and revoke keys from Stripe subscription events. Configure Stripe in `config.yaml`:
+
+```yaml
+stripe:
+  webhook_secret: "whsec_..."
+  api_key: "sk_live_..."
+  price_to_gateway:
+    "price_basic": ["summarize"]
+    "price_pro": ["summarize", "translate"]
+```
+
+Point Stripe at:
+
+```text
+POST /webhooks/stripe
+```
+
+`checkout.session.completed` creates a scoped key with `stripe_subscription_id`. `customer.subscription.deleted` revokes the matching key. Duplicate Stripe events are ignored via a small processed-event cache.
 
 ---
 
@@ -130,6 +166,14 @@ curl http://localhost:8000/__flowgate/stats
 
 For non-local access, set `FLOWGATE_ADMIN_KEY` or `admin.api_key` in `config.yaml` and call with `Authorization: Bearer <admin-key>`.
 
+The same admin protection is used for the read-only dashboard:
+
+```bash
+open http://localhost:8000/__flowgate/dashboard
+```
+
+For remote access, pass either `Authorization: Bearer <admin-key>` or `X-Admin-Key: <admin-key>`.
+
 ---
 
 ## Works with
@@ -152,7 +196,10 @@ flowgate/
 │   ├── auth.py         ← key validation
 │   ├── proxy.py        ← request forwarding
 │   ├── limiter.py      ← per-key rate limiting
-│   └── logger.py       ← usage logging
+│   ├── logger.py       ← usage logging
+│   └── stripe_webhooks.py
+├── templates/
+│   └── dashboard.html
 ├── logs/usage.log
 └── Dockerfile
 ```
