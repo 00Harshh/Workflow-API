@@ -1,10 +1,15 @@
 import secrets
-import yaml
 import re
 from pathlib import Path
 from datetime import date, datetime, time, timedelta, timezone
 
+from ruamel.yaml import YAML
+
 CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
+
+yaml = YAML()
+yaml.preserve_quotes = True
+yaml.indent(mapping=2, sequence=4, offset=2)
 
 
 class ExpiredKeyError(Exception):
@@ -91,12 +96,51 @@ def count_active_keys() -> int:
 
 def load_config() -> dict:
     with open(CONFIG_PATH, "r") as f:
-        return yaml.safe_load(f) or {}
+        return yaml.load(f) or {}
 
 
 def save_config(config: dict):
     with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        yaml.dump(config, f)
+
+
+def get_gateways(config: dict | None = None) -> list[dict]:
+    """Returns configured gateways, accepting legacy `workflows` configs."""
+    config = config or load_config()
+    return config.get("gateways") or config.get("workflows") or []
+
+
+def get_gateway_names(config: dict | None = None) -> set[str]:
+    return {gateway["name"] for gateway in get_gateways(config) if gateway.get("name")}
+
+
+def parse_allowed_gateways(value: str | list[str] | tuple[str, ...] | None) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        names = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        names = [str(part).strip() for part in value if str(part).strip()]
+    return names or None
+
+
+def validate_allowed_gateways(allowed_gateways: list[str] | None, config: dict | None = None):
+    if not allowed_gateways:
+        return
+
+    available = get_gateway_names(config)
+    unknown = sorted(set(allowed_gateways) - available)
+    if unknown:
+        available_text = ", ".join(sorted(available)) or "none configured"
+        unknown_text = ", ".join(unknown)
+        raise ValueError(f"Unknown gateway(s): {unknown_text}. Available gateways: {available_text}.")
+
+
+def key_allowed_for_gateway(key_record: dict, gateway_name: str) -> bool:
+    allowed_gateways = key_record.get("allowed_gateways")
+    if not allowed_gateways:
+        return True
+    return gateway_name in allowed_gateways
 
 
 def get_all_keys() -> list[dict]:
@@ -128,11 +172,19 @@ def validate_and_resolve(authorization: str | None) -> dict | None:
     return key_record
 
 
-def create_key(name: str, rate_limit_per_minute: int, expires_at: str | None = None) -> dict:
+def create_key(
+    name: str,
+    rate_limit_per_minute: int,
+    expires_at: str | None = None,
+    allowed_gateways: list[str] | None = None,
+    stripe_subscription_id: str | None = None,
+) -> dict:
     """Generates a new key, saves it to config, and returns the record."""
     config = load_config()
     if "keys" not in config or config["keys"] is None:
         config["keys"] = []
+
+    validate_allowed_gateways(allowed_gateways, config)
 
     raw = "wfapi-" + secrets.token_urlsafe(32)
     record = {
@@ -141,7 +193,11 @@ def create_key(name: str, rate_limit_per_minute: int, expires_at: str | None = N
         "rate_limit_per_minute": rate_limit_per_minute,
         "created_at": _utc_now().strftime("%Y-%m-%d"),
         "expires_at": expires_at,
+        "allowed_gateways": allowed_gateways,
     }
+    if stripe_subscription_id:
+        record["stripe_subscription_id"] = stripe_subscription_id
+
     config["keys"].append(record)
     save_config(config)
     return record

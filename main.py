@@ -5,7 +5,14 @@ import secrets
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from core.auth import ExpiredKeyError, count_active_keys, load_config, validate_and_resolve
+from core.auth import (
+    ExpiredKeyError,
+    count_active_keys,
+    get_gateways,
+    key_allowed_for_gateway,
+    load_config,
+    validate_and_resolve,
+)
 from core.proxy import forward_request
 from core.limiter import limiter
 from core.logger import build_stats, log_request
@@ -26,7 +33,7 @@ app = FastAPI(
 
 # ── Register workflow routes ───────────────────────────────────────────────────
 
-workflows = config.get("workflows", [])
+workflows = get_gateways(config)
 
 for wf in workflows:
     endpoint = wf["endpoint"]
@@ -64,6 +71,22 @@ for wf in workflows:
                     level="WARNING",
                 )
                 return JSONResponse({"error": "Invalid or missing API key."}, status_code=401)
+
+            if not key_allowed_for_gateway(key_record, wf_name):
+                latency = (time.monotonic() - start) * 1000
+                log_request(
+                    request.url.path,
+                    403,
+                    latency,
+                    key_record.get("name"),
+                    gateway=wf_name,
+                    event="scope_denied",
+                    level="WARNING",
+                )
+                return JSONResponse(
+                    {"detail": "Key not authorized for this workflow"},
+                    status_code=403,
+                )
 
             # Rate limit — use this key's individual limit
             rpm = key_record.get("rate_limit_per_minute", 60)
@@ -119,6 +142,7 @@ async def health():
     return {
         "status": "ok",
         "workflows": [wf["name"] for wf in workflows],
+        "gateways": [wf["name"] for wf in workflows],
         "active_keys": count_active_keys(),
     }
 

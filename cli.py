@@ -13,14 +13,24 @@ from collections import deque
 from pathlib import Path
 
 import click
-import yaml
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
 from rich.prompt import Prompt, Confirm
 
-from core.auth import create_key, get_all_keys, is_key_expired, load_config, parse_expiration, revoke_key
+from core.auth import (
+    create_key,
+    get_all_keys,
+    get_gateways,
+    is_key_expired,
+    load_config,
+    parse_allowed_gateways,
+    parse_expiration,
+    revoke_key,
+    save_config,
+    validate_allowed_gateways,
+)
 from core.logger import get_log_path, level_for_status
 
 console = Console()
@@ -55,6 +65,17 @@ def _format_expiration(key_record: dict) -> str:
     if is_key_expired(key_record):
         return f"Expired ({expires_at})"
     return str(expires_at)
+
+
+def _format_scope(key_record: dict, max_length: int = 32) -> str:
+    allowed_gateways = key_record.get("allowed_gateways")
+    if not allowed_gateways:
+        return "All"
+
+    scope = ", ".join(allowed_gateways)
+    if len(scope) <= max_length:
+        return scope
+    return scope[: max_length - 3] + "..."
 
 
 def _log_line_level(line: str) -> str | None:
@@ -173,8 +194,7 @@ def init():
         }
     }
 
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    save_config(config)
 
     console.print()
     console.print("[green]✓[/green] config.yaml created\n")
@@ -207,7 +227,7 @@ def start(port):
 
     cfg = load_config()
     keys = cfg.get("keys") or []
-    workflows = cfg.get("workflows") or []
+    workflows = get_gateways(cfg)
 
     console.print()
     console.print(Panel.fit(
@@ -243,7 +263,7 @@ def status():
     print_banner()
 
     cfg = load_config()
-    workflows = cfg.get("workflows") or []
+    workflows = get_gateways(cfg)
     keys = cfg.get("keys") or []
     server = cfg.get("server", {})
 
@@ -267,6 +287,7 @@ def status():
     key_table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
     key_table.add_column("Name",       style="bold")
     key_table.add_column("Rate limit", style="cyan")
+    key_table.add_column("Scope",      style="magenta")
     key_table.add_column("Expires",    style="yellow")
     key_table.add_column("Created",    style="dim")
     key_table.add_column("Key prefix", style="dim")
@@ -274,7 +295,14 @@ def status():
     for k in keys:
         rpm = k.get("rate_limit_per_minute", 60)
         limit_str = f"{rpm} req/min" if rpm > 0 else "Unlimited"
-        key_table.add_row(k["name"], limit_str, _format_expiration(k), k.get("created_at", "-"), k["key"][:22] + "...")
+        key_table.add_row(
+            k["name"],
+            limit_str,
+            _format_scope(k),
+            _format_expiration(k),
+            k.get("created_at", "-"),
+            k["key"][:22] + "...",
+        )
 
     console.print("[bold]API Keys[/bold]")
     if keys:
@@ -315,7 +343,7 @@ def keys():
     pass
 
 
-def _create_key_interactive(name=None, rate_limit=None, expires_at=None, expires_in=None):
+def _create_key_interactive(name=None, rate_limit=None, expires_at=None, expires_in=None, gateways=None):
     if not name:
         name = Prompt.ask("[cyan]Key name / tier[/cyan] (e.g. Free, Pro, Enterprise)")
     if rate_limit is None:
@@ -324,18 +352,27 @@ def _create_key_interactive(name=None, rate_limit=None, expires_at=None, expires
 
     try:
         parsed_expires_at = parse_expiration(expires_at=expires_at, expires_in=expires_in)
+        allowed_gateways = parse_allowed_gateways(gateways)
+        validate_allowed_gateways(allowed_gateways)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    record = create_key(name=name, rate_limit_per_minute=rate_limit, expires_at=parsed_expires_at)
+    record = create_key(
+        name=name,
+        rate_limit_per_minute=rate_limit,
+        expires_at=parsed_expires_at,
+        allowed_gateways=allowed_gateways,
+    )
 
     limit_str = f"{rate_limit} req/min" if rate_limit > 0 else "Unlimited"
     expires_str = parsed_expires_at or "Never"
+    scope_str = ", ".join(allowed_gateways) if allowed_gateways else "All gateways"
     console.print()
     console.print(Panel(
         f"[bold green]Key created[/bold green]\n\n"
         f"  Name        [cyan]{record['name']}[/cyan]\n"
         f"  Rate limit  [cyan]{limit_str}[/cyan]\n"
+        f"  Scope       [cyan]{scope_str}[/cyan]\n"
         f"  Expires     [cyan]{expires_str}[/cyan]\n"
         f"  Key         [bold yellow]{record['key']}[/bold yellow]\n\n"
         f"[dim]Share this key with your user. It won't be shown again.[/dim]",
@@ -349,11 +386,18 @@ def _create_key_interactive(name=None, rate_limit=None, expires_at=None, expires
 @click.option("--rate-limit", type=int, help="Requests per minute. Use 0 for unlimited.")
 @click.option("--expires-in", help="Relative expiration, for example 30d, +30d, 12h, or 45m.")
 @click.option("--expires-at", help="Absolute expiration, for example 2026-12-31 or 2026-12-31T23:59:59Z.")
-def keys_create(name, rate_limit, expires_in, expires_at):
+@click.option("--gateways", "--scope", help="Comma-separated gateway names this key can access. Omit for all gateways.")
+def keys_create(name, rate_limit, expires_in, expires_at, gateways):
     """Generate a new API key with a custom rate limit."""
     require_config()
     console.print()
-    _create_key_interactive(name=name, rate_limit=rate_limit, expires_at=expires_at, expires_in=expires_in)
+    _create_key_interactive(
+        name=name,
+        rate_limit=rate_limit,
+        expires_at=expires_at,
+        expires_in=expires_in,
+        gateways=gateways,
+    )
     console.print()
 
 
@@ -372,6 +416,7 @@ def keys_list():
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
     table.add_column("Name",        style="bold")
     table.add_column("Rate limit",  style="cyan")
+    table.add_column("Scope",       style="magenta")
     table.add_column("Expires",     style="yellow")
     table.add_column("Created",     style="dim")
     table.add_column("Key",         style="dim")
@@ -379,7 +424,14 @@ def keys_list():
     for k in all_keys:
         rpm = k.get("rate_limit_per_minute", 60)
         limit_str = f"{rpm} req/min" if rpm > 0 else "Unlimited"
-        table.add_row(k["name"], limit_str, _format_expiration(k), k.get("created_at", "-"), k["key"][:28] + "...")
+        table.add_row(
+            k["name"],
+            limit_str,
+            _format_scope(k),
+            _format_expiration(k),
+            k.get("created_at", "-"),
+            k["key"][:28] + "...",
+        )
 
     console.print(table)
 
