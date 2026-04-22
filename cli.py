@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Workflow API CLI
 Usage: python cli.py <command>

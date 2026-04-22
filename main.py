@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import time
 import os
@@ -267,121 +268,8 @@ async def dashboard(request: Request):
 
 # ── User self-serve portal ────────────────────────────────────────────────────
 
-# Fix #8: Per-IP rate limit for portal lookup (5-second cooldown per IP)
-_lookup_hits: dict[str, float] = {}
-_LOOKUP_IP_INTERVAL = 5.0  # seconds
-
-
-@app.get("/portal")
-async def portal_page(request: Request):
-    return templates.TemplateResponse("portal.html", {"request": request})
-
-
-@app.post("/portal/lookup")
-async def portal_lookup(request: Request):
-    # Fix #8: Rate-limit portal lookup by IP to slow down email enumeration
-    client_ip = (
-        get_real_client_ip(dict(request.headers))
-        or (request.client.host if request.client else "unknown")
-    )
-    now = time.monotonic()
-    if now - _lookup_hits.get(client_ip, 0.0) < _LOOKUP_IP_INTERVAL:
-        return JSONResponse({"error": "Too many requests. Please wait a few seconds."}, status_code=429)
-    _lookup_hits[client_ip] = now
-
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    email = (data.get("email") or "").strip().lower()
-    if not email:
-        return JSONResponse({"error": "Email is required."}, status_code=400)
-
-    store = get_store()
-    keys = store.find_key_by_email(email)
-    if not keys:
-        return JSONResponse(
-            {"error": "No subscription found for this email address."},
-            status_code=404,
-        )
-
-    from core.auth import is_key_expired
-    k = keys[0]
-    # Fix #8: Do not return key_prefix — reduces enumeration value
-    return JSONResponse({
-        "found":                 True,
-        "name":                  k.get("name"),
-        "rate_limit_per_minute": k.get("rate_limit_per_minute", 60),
-        "allowed_gateways":      k.get("allowed_gateways") or [],
-        "created_at":            k.get("created_at"),
-        "expires_at":            k.get("expires_at"),
-        "expired":               is_key_expired(k),
-    })
-
-
-@app.post("/portal/resend")
-async def portal_resend(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    email = (data.get("email") or "").strip().lower()
-    if not email:
-        return JSONResponse({"error": "Email is required."}, status_code=400)
-
-    store = get_store()
-
-    # Fix #3: Cross-worker safe cooldown check via store (no in-process dict)
-    allowed, remaining = store.check_and_set_resend_cooldown(email, cooldown_seconds=300)
-    if not allowed:
-        return JSONResponse(
-            {"error": f"Please wait {remaining}s before regenerating again."},
-            status_code=429,
-        )
-
-    old_keys = store.find_key_by_email(email)
-    if not old_keys:
-        return JSONResponse(
-            {"error": "No subscription found for this email address."},
-            status_code=404,
-        )
-
-    old = old_keys[0]
-    old_hashes = [k["key_hash"] for k in old_keys]
-
-    from core.auth import create_key
-    from core.email_sender import async_send_api_key_email
-
-    display_host = "localhost" if HOST in ("0.0.0.0", "::") else HOST
-    portal_url = f"http://{display_host}:{PORT}/portal"
-
-    # Create new key with same settings
-    new_record = create_key(
-        name=old.get("name", "user"),
-        rate_limit_per_minute=old.get("rate_limit_per_minute", 60),
-        expires_at=old.get("expires_at"),
-        allowed_gateways=old.get("allowed_gateways"),
-        stripe_subscription_id=old.get("stripe_subscription_id"),
-        email=email,
-    )
-
-    # Revoke all old keys for this email
-    for h in old_hashes:
-        store.revoke_key_by_hash(h)
-
-    gateways = new_record.get("allowed_gateways") or []
-    await async_send_api_key_email(
-        to=email,
-        key=new_record["key"],
-        name=new_record.get("name", "user"),
-        gateways=gateways,
-        rate_limit=new_record.get("rate_limit_per_minute", 60),
-        portal_url=portal_url,
-    )
-
-    return JSONResponse({"success": True, "message": "New API key sent to your email."})
+# [REMOVED] The built-in portal was removed to maintain a pure headless Developer Tool architecture. 
+# Users can build their own portal by hitting the SQLite database directly from their Next.js/React frontend.
 
 
 # ── Stripe webhook ────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import time
 from collections import OrderedDict
@@ -104,7 +105,8 @@ class RedisRateLimiter:
         return count <= rate_limit_per_minute
 
 
-def _build_limiter() -> RateLimiter | RedisRateLimiter:
+from typing import Union
+def _build_limiter() -> Union[RateLimiter, RedisRateLimiter]:
     """
     Try to connect to Redis. If reachable, return a RedisRateLimiter.
     Otherwise, fall back to the in-memory RateLimiter and print a notice.

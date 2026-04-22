@@ -45,6 +45,10 @@ def validate_target_url(url: str) -> None:
 
     Called at Workflow API startup for every configured workflow target.
     """
+    import os
+    if os.environ.get("WORKFLOW_API_ENV", "production").lower() == "development":
+        return
+
     if not url or not url.strip():
         raise ValueError("Target URL must not be empty.")
 

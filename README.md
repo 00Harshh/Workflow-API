@@ -66,6 +66,11 @@ workflow-api keys create --name "Client A" --rate-limit 120
 ```
 This produces a hash-safeguarded secure key (`wfapi-...`) that you can directly send to your client via Slack/Email.
 
+### Security Note: Where are API Keys Saved?
+When you (or the Stripe integration) generate an API key, the system does **not** save the actual API key. 
+Instead, it runs the raw key through a one-way mathematical function called a **SHA-256 Hash**, and only saves that scrambled hash in your `workflow-api.db` SQLite database (or your `config.yaml` depending on configuration). 
+Because the key is securely hashed, neither you nor an attacker can reverse-engineer the original key. If a customer loses their key, there is no "Show API Key" button—you simply revoke the old one and generate a fresh key for them.
+
 ---
 
 ## Prerequisites
@@ -477,6 +482,17 @@ The matching key should be removed.
 Important: Stripe's default trigger payload may use a test Price ID that is not in your `price_to_gateway` mapping. If no key is created, check `workflow-api logs` for an `stripe_price_unmapped` warning and add the test Price ID to the mapping.
 
 ---
+
+## 10. Building a Custom Dashboard or Portal (Headless Mode)
+
+Workflow API is built as a pure **Faceless Developer Tool**. For maximum security, it does not include public-facing HTML lookups or a dashboard by default.
+
+If you want to build your own custom GUI (e.g. in React, Next.js, or Vue):
+- **Admin Dashboard:** Make an authenticated `GET` request from your Frontend/Backend to `http://your-server:8000/__workflow-api/stats` using your `X-Admin-Key`. This returns a rich JSON payload containing live traffic metrics, active keys, and recent activity.
+- **Customer Portal:** If you want your customers to look up their API usage or endpoints, your custom frontend should query the `workflow-api.db` SQLite database directly (or you can use the CLI dynamically).
+
+---
+
 
 ## 10. Deploy 24/7 (Live Production)
 
