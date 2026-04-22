@@ -1,8 +1,8 @@
-# FlowGate
+# Workflow API
 
 Turn any HTTP workflow into a protected, rate-limited, monetizable API.
 
-FlowGate is a small self-hosted gateway for n8n, Zapier, custom scripts, or any workflow with a webhook URL. It sits in front of your workflow and adds:
+Workflow API is a small self-hosted gateway for n8n, Zapier, custom scripts, or any workflow with a webhook URL. It sits in front of your workflow and adds:
 
 - API key authentication
 - Per-key rate limits
@@ -12,17 +12,19 @@ FlowGate is a small self-hosted gateway for n8n, Zapier, custom scripts, or any 
 - Usage stats and a read-only dashboard
 - Optional Stripe webhook automation for subscription-based key creation and revocation
 
-FlowGate does not run your workflow, process payments, or require a database. Everything lives in `config.yaml` and `logs/`.
+Workflow API does not run your workflow, process payments, or require a database. Everything lives in `config.yaml` and `logs/`.
 
-Want a local dry run first? Follow [DEMO_TESTING.md](DEMO_TESTING.md) to test FlowGate end to end with a mock webhook server.
+Want a local dry run first? Follow [DEMO_TESTING.md](DEMO_TESTING.md) to test Workflow API end to end with a mock webhook server.
 
 ---
 
 ## How It Works
 
+Workflow API acts as a transparent, high-performance gateway between your customers and your backend workflows. It excels at **protecting lead generation endpoints**, AI app routing, or SaaS integrations.
+
 ```text
 Customer or app
-  -> FlowGate endpoint, for example /run/summarize
+  -> Workflow API endpoint, for example /run/generate-lead
   -> API key validation
   -> per-key rate limit check
   -> optional gateway scope check
@@ -30,7 +32,39 @@ Customer or app
   -> response returned unchanged
 ```
 
-In this README, "gateway" means a configured workflow entry. The current CLI writes these under `workflows:` in `config.yaml`, and FlowGate also supports a `gateways:` section for newer configs.
+**GET vs POST Requests:**
+Workflow API completely supports both `GET` and `POST` methods. When configuring a workflow in `config.yaml`, you declare the HTTP method it listens to. If you need a single endpoint strategy that accommodates both (for example, fetching records and creating records), you simply register two workflow configurations spanning both methods, and your user's API key will seamlessly handle both limits.
+
+**How it Works with SQL Databases:**
+Workflow API uses an embedded **local SQLite database** (`workflow-api.db`) to quickly handle key hashing, rate limits, and billing without forcing you to set up an external database. 
+If your specific business logic (e.g. fetching lead-gen data) requires querying Postgres or MySQL, **you connect that SQL Database directly to your Workflow Engine (like n8n), NOT to Workflow API.**
+1. The user sends a request to the Workflow API.
+2. The API secures, rate-limits, and forwards it to n8n.
+3. n8n queries your raw PostgreSQL/MySQL database.
+4. n8n returns the data, which Workflow API securely bounces back to the user.
+This separation of concerns means you can protect literally any tech stack without rewriting connection code.
+
+In this README, "gateway" means a configured workflow entry. The current CLI writes these under `workflows:` in `config.yaml`, and Workflow API also supports a `gateways:` section for newer configs.
+
+---
+
+## 2 Ways to Generate an API Key
+
+How keys are created usually depends on whether you're selling access or creating internal tooling. Workflow API fully supports both out of the box:
+
+### 1. Fully Automated (Self-Serve via Stripe)
+If you are generating income by selling access to your API:
+1. You share a Stripe Payment Link.
+2. The user buys a subscription.
+3. Stripe hits Workflow API's background webhook mechanism.
+4. Workflow API instantly provisions a new scoped, rate-limited key, embeds it in an HTML email, and dispatches it automatically to the buyer. Passive income, zero manual work.
+
+### 2. Manual Command Line (Free / Internal Use)
+For internal use, individual clients, or free access, you can run a single command on your terminal to instantly mint a key:
+```bash
+workflow-api keys create --name "Client A" --rate-limit 120
+```
+This produces a hash-safeguarded secure key (`wfapi-...`) that you can directly send to your client via Slack/Email.
 
 ---
 
@@ -45,11 +79,11 @@ On many machines the command is `python3`, not `python`. The examples below use 
 
 ---
 
-## 1. Install FlowGate
+## 1. Install Workflow API
 
 ```bash
-git clone https://github.com/yourusername/flowgate.git
-cd flowgate
+git clone https://github.com/yourusername/workflow-api.git
+cd workflow-api
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -60,10 +94,10 @@ pip install -r requirements.txt
 Optional convenience alias:
 
 ```bash
-alias flowgate="python3 cli.py"
+alias workflow-api="python3 cli.py"
 ```
 
-If you do not add the alias, use `python3 cli.py` anywhere this README shows `flowgate`.
+If you do not add the alias, use `python3 cli.py` anywhere this README shows `workflow-api`.
 
 ---
 
@@ -75,14 +109,14 @@ For n8n, the easiest path is the one-command setup:
 python3 cli.py n8n --url http://localhost:5678/webhook-test/n8ntest2 --name n8ntest --force
 ```
 
-This writes `config.yaml`, creates a scoped test API key, and prints the exact `curl` command to test your FlowGate endpoint.
+This writes `config.yaml`, creates a scoped test API key, and prints the exact `curl` command to test your Workflow API endpoint.
 
 If you want the step-by-step wizard instead, run:
 
 Run the setup wizard:
 
 ```bash
-flowgate init
+workflow-api init
 ```
 
 You will be asked for:
@@ -127,17 +161,17 @@ You normally do not need to edit `config.yaml` manually except for optional admi
 
 ---
 
-## 3. Start FlowGate
+## 3. Start Workflow API
 
 Make sure your workflow service is running first. For n8n, that usually means n8n is running and the webhook URL is active.
 
-Then start FlowGate:
+Then start Workflow API:
 
 ```bash
-flowgate start
+workflow-api start
 ```
 
-FlowGate will listen on the configured port, usually:
+Workflow API will listen on the configured port, usually:
 
 ```text
 http://localhost:8000
@@ -151,15 +185,15 @@ http://localhost:8000/docs
 
 ---
 
-## 4. Call Your Workflow Through FlowGate
+## 4. Call Your Workflow Through Workflow API
 
-Use the key printed by `flowgate init` or create a new one:
+Use the key printed by `workflow-api init` or create a new one:
 
 ```bash
-flowgate key create --name Pro --rate-limit 100
+workflow-api key create --name Pro --rate-limit 100
 ```
 
-Call the public FlowGate endpoint:
+Call the public Workflow API endpoint:
 
 ```bash
 curl -X POST http://localhost:8000/run/my-workflow \
@@ -168,7 +202,7 @@ curl -X POST http://localhost:8000/run/my-workflow \
   -d '{"input": "hello"}'
 ```
 
-FlowGate forwards the request body and query params to your workflow URL, then returns the workflow response.
+Workflow API forwards the request body and query params to your workflow URL, then returns the workflow response.
 
 ---
 
@@ -177,38 +211,38 @@ FlowGate forwards the request body and query params to your workflow URL, then r
 Create an unlimited key:
 
 ```bash
-flowgate key create --name Enterprise --rate-limit 0
+workflow-api key create --name Enterprise --rate-limit 0
 ```
 
 Create a temporary trial key:
 
 ```bash
-flowgate key create --name Trial --rate-limit 20 --expires-in 30d
+workflow-api key create --name Trial --rate-limit 20 --expires-in 30d
 ```
 
 Create a key that expires on a specific date:
 
 ```bash
-flowgate key create --name Trial --rate-limit 20 --expires-at 2026-12-31
+workflow-api key create --name Trial --rate-limit 20 --expires-at 2026-12-31
 ```
 
 List keys:
 
 ```bash
-flowgate key list
+workflow-api key list
 ```
 
 Revoke all keys with a given name:
 
 ```bash
-flowgate key revoke Trial
+workflow-api key revoke Trial
 ```
 
 `key` and `keys` both work:
 
 ```bash
-flowgate keys list
-flowgate key list
+workflow-api keys list
+workflow-api key list
 ```
 
 ---
@@ -220,7 +254,7 @@ By default, a key can call every configured workflow. To limit a key to specific
 Example:
 
 ```bash
-flowgate key create \
+workflow-api key create \
   --name Basic \
   --rate-limit 30 \
   --gateways my-workflow
@@ -229,15 +263,15 @@ flowgate key create \
 Multiple gateways:
 
 ```bash
-flowgate key create \
+workflow-api key create \
   --name Pro \
   --rate-limit 200 \
   --gateways summarize,translate
 ```
 
-FlowGate validates that each gateway name exists in `config.yaml`.
+Workflow API validates that each gateway name exists in `config.yaml`.
 
-If a scoped key calls a gateway it is not allowed to use, FlowGate returns:
+If a scoped key calls a gateway it is not allowed to use, Workflow API returns:
 
 ```json
 {"detail": "Key not authorized for this workflow"}
@@ -252,19 +286,19 @@ Existing keys without `allowed_gateways` continue to work for all gateways.
 Show the last 20 log entries:
 
 ```bash
-flowgate logs
+workflow-api logs
 ```
 
 Follow logs live:
 
 ```bash
-flowgate logs --follow
+workflow-api logs --follow
 ```
 
 Filter by severity:
 
 ```bash
-flowgate logs --level ERROR
+workflow-api logs --level ERROR
 ```
 
 Default log path:
@@ -276,7 +310,7 @@ logs/usage.log
 Override the log path with an environment variable:
 
 ```bash
-FLOWGATE_LOG_FILE=/var/log/flowgate.log flowgate start
+WORKFLOW_API_LOG_FILE=/var/log/workflow-api.log workflow-api start
 ```
 
 Or configure it in `config.yaml`:
@@ -301,33 +335,33 @@ Localhost can access stats and the dashboard without an admin key.
 Stats:
 
 ```bash
-curl http://localhost:8000/__flowgate/stats
+curl http://localhost:8000/__workflow-api/stats
 ```
 
 Dashboard:
 
 ```text
-http://localhost:8000/__flowgate/dashboard
+http://localhost:8000/__workflow-api/dashboard
 ```
 
 For remote access, set an admin key. You can use an environment variable:
 
 ```bash
-export FLOWGATE_ADMIN_KEY="change-this-admin-secret"
-flowgate start
+export WORKFLOW_API_ADMIN_KEY="change-this-admin-secret"
+workflow-api start
 ```
 
 Then call:
 
 ```bash
-curl http://your-server:8000/__flowgate/stats \
+curl http://your-server:8000/__workflow-api/stats \
   -H "Authorization: Bearer change-this-admin-secret"
 ```
 
 Or:
 
 ```bash
-curl http://your-server:8000/__flowgate/stats \
+curl http://your-server:8000/__workflow-api/stats \
   -H "X-Admin-Key: change-this-admin-secret"
 ```
 
@@ -341,7 +375,7 @@ admin:
 Dashboard URL:
 
 ```text
-http://your-server:8000/__flowgate/dashboard
+http://your-server:8000/__workflow-api/dashboard
 ```
 
 The dashboard is read-only. It does not create, edit, or revoke anything.
@@ -350,11 +384,11 @@ The dashboard is read-only. It does not create, edit, or revoke anything.
 
 ## 9. Optional Stripe Automation
 
-Stripe automation lets FlowGate create and revoke API keys from subscription events.
+Stripe automation lets Workflow API create and revoke API keys from subscription events.
 
 What it does:
 
-- `checkout.session.completed` creates a new FlowGate key
+- `checkout.session.completed` creates a new Workflow API key
 - The key scope comes from the Stripe Price ID mapping
 - The key gets `stripe_subscription_id`
 - `customer.subscription.deleted` removes the matching key
@@ -362,9 +396,9 @@ What it does:
 
 What it does not do:
 
-- FlowGate does not email the key to the customer
-- FlowGate does not manage Stripe products or prices
-- FlowGate does not expose the generated key in the webhook response
+- Workflow API does not email the key to the customer
+- Workflow API does not manage Stripe products or prices
+- Workflow API does not expose the generated key in the webhook response
 
 ### 9.1 Configure Stripe
 
@@ -384,7 +418,7 @@ Notes:
 
 - `webhook_secret` comes from the Stripe webhook endpoint settings.
 - `api_key` is used to fetch checkout line items when Stripe does not include them in the event payload.
-- `price_to_gateway` maps Stripe Price IDs to FlowGate workflow names.
+- `price_to_gateway` maps Stripe Price IDs to Workflow API workflow names.
 - `rate_limit_per_minute` is optional and defaults to `60` for Stripe-created keys.
 
 ### 9.2 Add The Stripe Webhook Endpoint
@@ -412,10 +446,10 @@ Copy the `whsec_...` secret printed by Stripe CLI into `config.yaml`.
 
 ### 9.3 Test Stripe Locally
 
-Start FlowGate:
+Start Workflow API:
 
 ```bash
-flowgate start
+workflow-api start
 ```
 
 In another terminal:
@@ -440,48 +474,60 @@ stripe trigger customer.subscription.deleted
 
 The matching key should be removed.
 
-Important: Stripe's default trigger payload may use a test Price ID that is not in your `price_to_gateway` mapping. If no key is created, check `flowgate logs` for an `stripe_price_unmapped` warning and add the test Price ID to the mapping.
+Important: Stripe's default trigger payload may use a test Price ID that is not in your `price_to_gateway` mapping. If no key is created, check `workflow-api logs` for an `stripe_price_unmapped` warning and add the test Price ID to the mapping.
 
 ---
 
-## 10. Deploy With Docker
+## 10. Deploy 24/7 (Live Production)
 
-Build:
+To deploy the Workflow API so it runs automatically 24/7—even after server reboots—choose one of these highly resilient options:
 
-```bash
-docker build -t flowgate .
+### Option A: The "It Just Works" Cloud (Render / Railway)
+Best for developers who want a hands-off deployment. You can push workflows directly to Platform-as-a-service providers.
+1. Push this code to a private GitHub repo.
+2. Connect it to [Render.com](https://render.com) or [Railway.app](https://railway.app) as a new Web Service.
+3. Add your `WORKFLOW_API_ADMIN_KEY` as an environment variable.
+4. *Important:* Attach a Persistent Disk/Volume to the `/app/workflow-api.db` file so your API key hashes survive cloud redeploys.
+
+### Option B: The "Self-Hosted" VPS (DigitalOcean / AWS)
+Best for maximum edge-performance and total control. Place a `docker-compose.yml` file on an Ubuntu server:
+```yaml
+version: '3.8'
+services:
+  workflow-api:
+    build: .
+    container_name: workflow-api
+    restart: always  # Guarantees 24/7 uptime unconditionally
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./workflow-api.db:/app/workflow-api.db
+      - ./logs:/app/logs
+    environment:
+      - WORKFLOW_API_ADMIN_KEY=change-this-admin-secret
 ```
-
-Run:
-
-```bash
-docker run -d \
-  -p 8000:8000 \
-  -v $(pwd)/config.yaml:/app/config.yaml \
-  -v $(pwd)/logs:/app/logs \
-  --name flowgate \
-  flowgate
-```
+Turn it on by typing `docker-compose up -d --build`. The container will instantly boot up and securely stay alive in the background.
 
 With admin key:
 
 ```bash
 docker run -d \
   -p 8000:8000 \
-  -e FLOWGATE_ADMIN_KEY="change-this-admin-secret" \
+  -e WORKFLOW_API_ADMIN_KEY="change-this-admin-secret" \
   -v $(pwd)/config.yaml:/app/config.yaml \
   -v $(pwd)/logs:/app/logs \
-  --name flowgate \
-  flowgate
+  --name workflow-api \
+  workflow-api
 ```
 
 View container logs:
 
 ```bash
-docker logs -f flowgate
+docker logs -f workflow-api
 ```
 
-View FlowGate access logs from the mounted directory:
+View Workflow API access logs from the mounted directory:
 
 ```bash
 tail -f logs/usage.log
@@ -491,12 +537,12 @@ tail -f logs/usage.log
 
 ## 11. Production Checklist
 
-Before exposing FlowGate publicly:
+Before exposing Workflow API publicly:
 
-- Put FlowGate behind HTTPS, for example Caddy, Nginx, Traefik, or a cloud load balancer.
-- Set `FLOWGATE_ADMIN_KEY` or `admin.api_key`.
+- Put Workflow API behind HTTPS, for example Caddy, Nginx, Traefik, or a cloud load balancer.
+- Set `WORKFLOW_API_ADMIN_KEY` or `admin.api_key`.
 - Keep `config.yaml` private because it contains API keys.
-- Use filesystem permissions so only the FlowGate user can read `config.yaml`.
+- Use filesystem permissions so only the Workflow API user can read `config.yaml`.
 - Back up `config.yaml`.
 - Mount `logs/` as a persistent volume if using Docker.
 - Configure log rotation for long-running deployments.
@@ -523,13 +569,13 @@ Create a new key or use one without `expires_at`.
 The key has `allowed_gateways` and the workflow name is not included. Run:
 
 ```bash
-flowgate key list
+workflow-api key list
 ```
 
 Then create a correctly scoped key:
 
 ```bash
-flowgate key create --name Pro --rate-limit 200 --gateways my-workflow
+workflow-api key create --name Pro --rate-limit 200 --gateways my-workflow
 ```
 
 `429 Rate limit exceeded`
@@ -538,7 +584,7 @@ The key has used its per-minute allowance. Create a higher-tier key or wait for 
 
 `502 Could not reach workflow`
 
-FlowGate is running, but your target workflow URL is not reachable. Check that n8n, Zapier, or your app is running and that the target URL in `config.yaml` is correct.
+Workflow API is running, but your target workflow URL is not reachable. Check that n8n, Zapier, or your app is running and that the target URL in `config.yaml` is correct.
 
 `Stripe webhook returns 503`
 
@@ -552,27 +598,27 @@ Check:
 - The Checkout Session has a subscription ID.
 - The Stripe Price ID exists in `stripe.price_to_gateway`.
 - The mapped gateway names exist in `workflows:` or `gateways:`.
-- `flowgate logs` for `stripe_price_unmapped` or `stripe_scope_invalid`.
+- `workflow-api logs` for `stripe_price_unmapped` or `stripe_scope_invalid`.
 
 ---
 
 ## CLI Reference
 
 ```bash
-flowgate init
-flowgate start
-flowgate status
+workflow-api init
+workflow-api start
+workflow-api status
 
-flowgate key create
-flowgate key create --name Pro --rate-limit 200
-flowgate key create --name Trial --rate-limit 20 --expires-in 30d
-flowgate key create --name Basic --rate-limit 30 --gateways my-workflow
-flowgate key list
-flowgate key revoke Pro
+workflow-api key create
+workflow-api key create --name Pro --rate-limit 200
+workflow-api key create --name Trial --rate-limit 20 --expires-in 30d
+workflow-api key create --name Basic --rate-limit 30 --gateways my-workflow
+workflow-api key list
+workflow-api key revoke Pro
 
-flowgate logs
-flowgate logs --follow
-flowgate logs --level ERROR
+workflow-api logs
+workflow-api logs --follow
+workflow-api logs --level ERROR
 ```
 
 Without the alias:
@@ -587,7 +633,7 @@ python3 cli.py key list
 ## Project Structure
 
 ```text
-flowgate/
+workflow-api/
   cli.py
   main.py
   config.yaml

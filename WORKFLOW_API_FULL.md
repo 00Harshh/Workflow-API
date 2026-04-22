@@ -1,4 +1,4 @@
-# FlowGate — Full Project Document
+# Workflow API — Full Project Document
 
 > From problem statement to architecture to future roadmap.
 
@@ -29,9 +29,9 @@ The existing options all fail in some way:
 
 ---
 
-## 2. What FlowGate Is
+## 2. What Workflow API Is
 
-FlowGate is a thin auth + proxy layer that sits between the outside world and a user's existing workflow.
+Workflow API is a thin auth + proxy layer that sits between the outside world and a user's existing workflow.
 
 It does exactly four things:
 
@@ -51,7 +51,7 @@ It does not host workflows. It does not run compute. It does not touch billing. 
 
 ### 3.1 Self-hosted by default
 
-FlowGate runs wherever the user's workflow runs. Local machine, VPS, home server — it doesn't matter. The user brings their own hosting. This eliminates vendor lock-in and makes it free to run.
+Workflow API runs wherever the user's workflow runs. Local machine, VPS, home server — it doesn't matter. The user brings their own hosting. This eliminates vendor lock-in and makes it free to run.
 
 ### 3.2 Config-driven, CLI-managed
 
@@ -63,7 +63,7 @@ Each API key has its own isolated token bucket. A Free tier user hitting their l
 
 ### 3.4 Pure passthrough proxy
 
-FlowGate does not transform requests or responses. It strips auth headers, forwards the body as-is to the target URL, and returns whatever the workflow returns. No schema enforcement, no data manipulation. This keeps it compatible with anything.
+Workflow API does not transform requests or responses. It strips auth headers, forwards the body as-is to the target URL, and returns whatever the workflow returns. No schema enforcement, no data manipulation. This keeps it compatible with anything.
 
 ### 3.5 No database
 
@@ -115,7 +115,7 @@ External Caller
 ### 4.2 File Structure
 
 ```
-flowgate/
+workflow-api/
 │
 ├── cli.py                ← primary interface for the user
 ├── main.py               ← FastAPI server, registers routes from config
@@ -233,7 +233,7 @@ Writes `config.yaml`, prints the generated key, and shows next steps.
 
 ## 6. Monetization Model
 
-FlowGate does not own the billing layer. It provides the infrastructure that makes billing possible.
+Workflow API does not own the billing layer. It provides the infrastructure that makes billing possible.
 
 The intended flow for a workflow creator:
 
@@ -276,13 +276,13 @@ The logs track which tier made each request, giving the creator usage data per c
 
 ---
 
-## 8. What FlowGate Deliberately Does Not Do
+## 8. What Workflow API Deliberately Does Not Do
 
 These are conscious non-decisions, not missing features:
 
-- **No billing integration** — FlowGate doesn't touch money. The creator handles that externally.
+- **No billing integration** — Workflow API doesn't touch money. The creator handles that externally.
 - **No dashboard UI** — the CLI is the UI. A web dashboard adds complexity and a server dependency.
-- **No workflow execution** — FlowGate only proxies. It never runs n8n, Zapier, or Python code itself.
+- **No workflow execution** — Workflow API only proxies. It never runs n8n, Zapier, or Python code itself.
 - **No database** — `config.yaml` and flat log files are intentionally sufficient for the v1 scope.
 - **No multi-user admin** — one operator per deployment. Not a SaaS platform.
 - **No request transformation** — body goes in, body comes out. Schema enforcement is the workflow's job.
@@ -301,13 +301,13 @@ python cli.py start
 ### VPS / live server
 
 ```bash
-docker build -t flowgate .
+docker build -t workflow-api .
 docker run -d \
   -p 8000:8000 \
   -v $(pwd)/config.yaml:/app/config.yaml \
   -v $(pwd)/logs:/app/logs \
-  --name flowgate \
-  flowgate
+  --name workflow-api \
+  workflow-api
 ```
 
 Works on any Ubuntu VPS, DigitalOcean Droplet, Hetzner server, Raspberry Pi, or home server.
@@ -357,14 +357,14 @@ If `workflows` is absent, the key has access to everything (current behaviour, b
 
 ### 10.4 Webhook on usage events (medium priority, medium effort)
 
-An optional `on_request` webhook in config that FlowGate pings after every successful request:
+An optional `on_request` webhook in config that Workflow API pings after every successful request:
 
 ```yaml
 hooks:
   on_request: https://your-server.com/usage-event
 ```
 
-Payload: `{tier, endpoint, timestamp, latency_ms}`. This lets the creator pipe usage data into Stripe metered billing, their own database, or Slack without any changes to FlowGate itself.
+Payload: `{tier, endpoint, timestamp, latency_ms}`. This lets the creator pipe usage data into Stripe metered billing, their own database, or Slack without any changes to Workflow API itself.
 
 ### 10.5 `cli.py logs` command (low priority, easy)
 
@@ -406,7 +406,7 @@ This would allow building a web dashboard or integrating key management into a S
 
 ### 10.8 n8n / Zapier native adapters (low priority, hard)
 
-Currently FlowGate works with n8n and Zapier because they both expose webhook URLs. A deeper integration would involve:
+Currently Workflow API works with n8n and Zapier because they both expose webhook URLs. A deeper integration would involve:
 
 - Auto-detecting n8n workflows via the n8n API
 - Listing available webhooks and letting the user pick one during `init`
@@ -432,9 +432,9 @@ Replace `config.yaml` + flat log file with SQLite when the log file grows large 
 
 ## 12. Summary
 
-FlowGate is a single-operator, self-hosted API gateway designed for workflow creators who want to monetize access to their automations without infrastructure complexity.
+Workflow API is a single-operator, self-hosted API gateway designed for workflow creators who want to monetize access to their automations without infrastructure complexity.
 
-The core insight is that the gap between "I built a workflow" and "I can sell API access to it" is entirely an auth + rate limiting problem. FlowGate solves exactly that, nothing more, and stays out of the way of everything else.
+The core insight is that the gap between "I built a workflow" and "I can sell API access to it" is entirely an auth + rate limiting problem. Workflow API solves exactly that, nothing more, and stays out of the way of everything else.
 
 The entire system is under 500 lines of Python across 6 files, ships in a single Docker container, requires no database, and can be set up in under 5 minutes by a non-technical user.
 

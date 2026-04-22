@@ -1,7 +1,13 @@
-import json
+"""
+core/stripe_webhooks.py — Stripe webhook event processing.
+
+Handles:
+  checkout.session.completed      → create API key, send email to customer
+  customer.subscription.deleted   → revoke API key
+"""
+from __future__ import annotations
+
 import re
-from collections import deque
-from pathlib import Path
 
 import stripe
 
@@ -14,10 +20,6 @@ from core.auth import (
 )
 from core.logger import log_request
 
-PROJECT_ROOT = Path(__file__).parent.parent
-PROCESSED_EVENTS_PATH = PROJECT_ROOT / "logs" / "stripe_events.json"
-MAX_PROCESSED_EVENTS = 100
-
 
 class StripeWebhookConfigError(Exception):
     """Raised when Stripe webhook config is missing or invalid."""
@@ -28,40 +30,35 @@ def _stripe_config(config: dict | None = None) -> dict:
     return config.get("stripe") or {}
 
 
-def _load_processed_event_ids() -> deque[str]:
-    if not PROCESSED_EVENTS_PATH.exists():
-        return deque(maxlen=MAX_PROCESSED_EVENTS)
-
+def _portal_url() -> str:
     try:
-        with open(PROCESSED_EVENTS_PATH, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        data = []
+        cfg = load_config()
+        server = cfg.get("server") or {}
+        host = server.get("host", "0.0.0.0")
+        port = server.get("port", 8000)
+        display_host = "localhost" if host in ("0.0.0.0", "::") else host
+        return f"http://{display_host}:{port}/portal"
+    except Exception:
+        return "http://localhost:8000/portal"
 
-    return deque((str(event_id) for event_id in data), maxlen=MAX_PROCESSED_EVENTS)
 
-
-def _save_processed_event_ids(event_ids: deque[str]):
-    PROCESSED_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(PROCESSED_EVENTS_PATH, "w") as f:
-        json.dump(list(event_ids), f)
-
+# ── Stripe event deduplication ────────────────────────────────────────────────
 
 def is_event_processed(event_id: str | None) -> bool:
     if not event_id:
         return False
-    return event_id in _load_processed_event_ids()
+    from core.store import get_store
+    return get_store().is_stripe_event_processed(event_id)
 
 
-def mark_event_processed(event_id: str | None):
+def mark_event_processed(event_id: str | None) -> None:
     if not event_id:
         return
+    from core.store import get_store
+    get_store().mark_stripe_event_processed(event_id)
 
-    event_ids = _load_processed_event_ids()
-    if event_id not in event_ids:
-        event_ids.append(event_id)
-        _save_processed_event_ids(event_ids)
 
+# ── Webhook signature verification ───────────────────────────────────────────
 
 def construct_event(payload: bytes, signature: str | None):
     stripe_cfg = _stripe_config()
@@ -70,6 +67,8 @@ def construct_event(payload: bytes, signature: str | None):
         raise StripeWebhookConfigError("Stripe webhook_secret is not configured.")
     return stripe.Webhook.construct_event(payload, signature, webhook_secret)
 
+
+# ── Helper utilities ──────────────────────────────────────────────────────────
 
 def _sanitize_name(value: str | None, fallback: str) -> str:
     raw = value or fallback
@@ -105,10 +104,8 @@ def _fetch_line_items(session_id: str, stripe_cfg: dict) -> list:
     configured_api_key = stripe_cfg.get("api_key")
     if configured_api_key:
         stripe.api_key = configured_api_key
-
     if not stripe.api_key:
         return []
-
     line_items = stripe.checkout.Session.list_line_items(session_id, limit=100)
     return list(_object_get(line_items, "data", []) or [])
 
@@ -118,11 +115,9 @@ def _extract_price_id(session, stripe_cfg: dict) -> str | None:
         price_id = _extract_price_id_from_line_item(line_item)
         if price_id:
             return price_id
-
     session_id = _object_get(session, "id")
     if not session_id:
         return None
-
     for line_item in _fetch_line_items(session_id, stripe_cfg):
         price_id = _extract_price_id_from_line_item(line_item)
         if price_id:
@@ -130,9 +125,13 @@ def _extract_price_id(session, stripe_cfg: dict) -> str | None:
     return None
 
 
-def _customer_reference(session, subscription_id: str) -> str:
+def _customer_email(session) -> str | None:
     customer_details = _object_get(session, "customer_details") or {}
-    email = _object_get(customer_details, "email")
+    return _object_get(customer_details, "email")
+
+
+def _customer_reference(session, subscription_id: str) -> str:
+    email = _customer_email(session)
     return (
         _object_get(session, "client_reference_id")
         or email
@@ -141,17 +140,15 @@ def _customer_reference(session, subscription_id: str) -> str:
     )
 
 
-def _create_key_for_checkout_session(session, event_id: str | None) -> dict:
+# ── Checkout completed → create key + send email ─────────────────────────────
+
+async def _create_key_for_checkout_session(session, event_id: str | None) -> dict:
     stripe_cfg = _stripe_config()
     subscription_id = _object_get(session, "subscription")
     if not subscription_id:
         log_request(
-            "/webhooks/stripe",
-            200,
-            0,
-            gateway="stripe",
-            event="stripe_checkout_missing_subscription",
-            level="WARNING",
+            "/webhooks/stripe", 200, 0,
+            gateway="stripe", event="stripe_checkout_missing_subscription", level="WARNING",
         )
         return {"action": "skipped", "reason": "missing_subscription"}
 
@@ -164,51 +161,53 @@ def _create_key_for_checkout_session(session, event_id: str | None) -> dict:
     allowed_gateways = price_to_gateway.get(price_id)
     if not price_id or not allowed_gateways:
         log_request(
-            "/webhooks/stripe",
-            200,
-            0,
-            gateway="stripe",
-            event="stripe_price_unmapped",
-            level="WARNING",
+            "/webhooks/stripe", 200, 0,
+            gateway="stripe", event="stripe_price_unmapped", level="WARNING",
         )
         return {"action": "skipped", "reason": "unmapped_price", "price_id": price_id}
 
     unknown_gateways = sorted(set(allowed_gateways) - get_gateway_names())
     if unknown_gateways:
         log_request(
-            "/webhooks/stripe",
-            200,
-            0,
-            gateway="stripe",
-            event="stripe_scope_invalid",
-            level="ERROR",
+            "/webhooks/stripe", 200, 0,
+            gateway="stripe", event="stripe_scope_invalid", level="ERROR",
         )
-        return {
-            "action": "skipped",
-            "reason": "unknown_gateways",
-            "gateways": unknown_gateways,
-        }
+        return {"action": "skipped", "reason": "unknown_gateways", "gateways": unknown_gateways}
 
+    email = _customer_email(session)
     name = _sanitize_name(_customer_reference(session, subscription_id), f"stripe-{subscription_id}")
     rate_limit = int(stripe_cfg.get("rate_limit_per_minute") or 60)
+
     key_record = create_key(
         name=name,
         rate_limit_per_minute=rate_limit,
         expires_at=None,
         allowed_gateways=list(allowed_gateways),
         stripe_subscription_id=subscription_id,
+        email=email,
     )
+
     log_request(
-        "/webhooks/stripe",
-        200,
-        0,
-        key_record.get("name"),
-        gateway="stripe",
-        event="stripe_key_created",
-        level="INFO",
+        "/webhooks/stripe", 200, 0, key_record.get("name"),
+        gateway="stripe", event="stripe_key_created", level="INFO",
     )
+
+    # Send API key to customer's email (non-blocking)
+    if email:
+        from core.email_sender import async_send_api_key_email
+        await async_send_api_key_email(
+            to=email,
+            key=key_record["key"],   # raw key — only available right now
+            name=name,
+            gateways=list(allowed_gateways),
+            rate_limit=rate_limit,
+            portal_url=_portal_url(),
+        )
+
     return {"action": "created", "subscription_id": subscription_id, "event_id": event_id}
 
+
+# ── Subscription deleted → revoke key ────────────────────────────────────────
 
 def _revoke_key_for_deleted_subscription(subscription, event_id: str | None) -> dict:
     subscription_id = _object_get(subscription, "id")
@@ -217,9 +216,7 @@ def _revoke_key_for_deleted_subscription(subscription, event_id: str | None) -> 
 
     revoked = revoke_key_by_stripe_subscription(subscription_id)
     log_request(
-        "/webhooks/stripe",
-        200,
-        0,
+        "/webhooks/stripe", 200, 0,
         gateway="stripe",
         event="stripe_key_revoked" if revoked else "stripe_key_revoke_miss",
         level="INFO" if revoked else "WARNING",
@@ -231,7 +228,9 @@ def _revoke_key_for_deleted_subscription(subscription, event_id: str | None) -> 
     }
 
 
-def process_event(event) -> dict:
+# ── Main dispatcher ───────────────────────────────────────────────────────────
+
+async def process_event(event) -> dict:
     event_id = _object_get(event, "id")
     if is_event_processed(event_id):
         return {"received": True, "duplicate": True}
@@ -241,7 +240,7 @@ def process_event(event) -> dict:
     event_object = _object_get(event_data, "object") or {}
 
     if event_type == "checkout.session.completed":
-        result = _create_key_for_checkout_session(event_object, event_id)
+        result = await _create_key_for_checkout_session(event_object, event_id)
     elif event_type == "customer.subscription.deleted":
         result = _revoke_key_for_deleted_subscription(event_object, event_id)
     else:

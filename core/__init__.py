@@ -1,1 +1,1 @@
-"""Core FlowGate modules."""
+"""Core Workflow API modules."""

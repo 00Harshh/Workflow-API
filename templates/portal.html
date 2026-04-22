@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Workflow API — My API Access</title>
+  <meta name="description" content="Look up your Workflow API API key and usage information." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #07070d;
+      --surface:   #0f0f1a;
+      --card:      #141422;
+      --border:    #1e1e30;
+      --border-hi: #2d2d50;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --accent:    #7c3aed;
+      --accent-lo: #4c1d95;
+      --accent-hi: #a78bfa;
+      --success:   #10b981;
+      --error:     #f87171;
+      --glow:      rgba(124, 58, 237, 0.15);
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 16px 80px;
+      overflow-x: hidden;
+    }
+
+    /* Ambient glow orbs */
+    body::before, body::after {
+      content: '';
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body::before {
+      width: 600px; height: 600px;
+      background: rgba(109, 40, 217, 0.12);
+      top: -200px; left: -200px;
+    }
+    body::after {
+      width: 500px; height: 500px;
+      background: rgba(124, 58, 237, 0.08);
+      bottom: -150px; right: -150px;
+    }
+
+    .container { width: 100%; max-width: 520px; position: relative; z-index: 1; }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 48px;
+    }
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .logo-icon {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, var(--accent-lo), var(--accent));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+    .logo-text { font-size: 22px; font-weight: 700; color: var(--text); }
+    .header h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 8px; }
+    .header p { color: var(--muted); font-size: 14px; line-height: 1.6; }
+
+    /* Card */
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      margin-bottom: 16px;
+      backdrop-filter: blur(12px);
+    }
+    .card:hover { border-color: var(--border-hi); transition: border-color 0.2s; }
+
+    /* Form */
+    .form-group { margin-bottom: 20px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; font-weight: 500; letter-spacing: 0.3px; }
+    input[type="email"] {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      font-size: 14px;
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    input[type="email"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--glow);
+    }
+    input[type="email"]::placeholder { color: #3d3d5c; }
+
+    /* Buttons */
+    .btn {
+      width: 100%;
+      padding: 14px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: 'Inter', sans-serif;
+      cursor: pointer;
+      border: none;
+      transition: opacity 0.15s, transform 0.1s;
+      letter-spacing: 0.2px;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-lo), var(--accent));
+      color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) { opacity: 0.9; }
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      margin-top: 10px;
+    }
+    .btn-outline:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-hi); }
+
+    /* Result card */
+    .result { display: none; }
+    .result.visible { display: block; animation: fadeIn 0.3s ease; }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+    .section-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--accent-hi);
+      margin-bottom: 10px;
+    }
+
+    .key-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+    .key-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      color: var(--accent-hi);
+      word-break: break-all;
+      line-height: 1.6;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .meta-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .meta-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .meta-value { font-size: 14px; font-weight: 600; color: var(--text); }
+
+    .gateways-list { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+    .gateway-chip {
+      background: rgba(124, 58, 237, 0.15);
+      border: 1px solid rgba(124, 58, 237, 0.3);
+      border-radius: 20px;
+      padding: 5px 14px;
+      font-size: 12px;
+      color: var(--accent-hi);
+      font-weight: 500;
+    }
+
+    .divider { height: 1px; background: var(--border); margin: 20px 0; }
+
+    /* Alert banner */
+    .alert {
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.5;
+      margin-bottom: 16px;
+    }
+    .alert-error { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.25); color: var(--error); }
+    .alert-success { background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.25); color: var(--success); }
+    .alert { display: none; }
+    .alert.visible { display: block; animation: fadeIn 0.2s ease; }
+
+    /* Spinner */
+    .spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 32px;
+    }
+    .footer a { color: var(--accent-hi); text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <span class="logo-text">Workflow API</span>
+      </div>
+      <h1>Your API Access</h1>
+      <p>Enter the email you used at checkout to view your API key details and regenerate if needed.</p>
+    </div>
+
+    <!-- Alert -->
+    <div id="alert" class="alert"></div>
+
+    <!-- Lookup form -->
+    <div class="card" id="lookupCard">
+      <p class="section-label">Look up by email</p>
+      <div class="form-group">
+        <label for="emailInput">Email address</label>
+        <input id="emailInput" type="email" placeholder="you@example.com" autocomplete="email" />
+      </div>
+      <button id="lookupBtn" class="btn btn-primary" onclick="lookup()">
+        Look Up My Key
+      </button>
+    </div>
+
+    <!-- Result -->
+    <div id="result" class="card result">
+      <p class="section-label">Your API Key</p>
+      <div class="key-box">
+        <div class="key-value" id="keyDisplay">wfapi-XXXXXXXX...</div>
+      </div>
+
+      <div class="meta-grid">
+        <div class="meta-item">
+          <div class="meta-label">Rate Limit</div>
+          <div class="meta-value" id="rateLimit">—</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Created</div>
+          <div class="meta-value" id="createdAt">—</div>
+        </div>
+      </div>
+
+      <p class="section-label">Gateway Access</p>
+      <div class="gateways-list" id="gatewaysList"></div>
+
+      <div class="divider"></div>
+
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.6">
+        Lost your full key? We'll generate a new one and send it to your email. Your old key will be revoked.
+      </p>
+      <button id="resendBtn" class="btn btn-outline" onclick="resend()">
+        🔄 Regenerate &amp; Email New Key
+      </button>
+    </div>
+
+    <div class="footer">
+      Powered by <a href="/docs">Workflow API</a> · <a href="/health">Status</a>
+    </div>
+  </div>
+
+  <script>
+    let currentEmail = '';
+
+    function showAlert(msg, type = 'error') {
+      const el = document.getElementById('alert');
+      el.textContent = msg;
+      el.className = `alert alert-${type} visible`;
+      setTimeout(() => el.classList.remove('visible'), 5000);
+    }
+
+    function setLoading(btnId, loading, originalText) {
+      const btn = document.getElementById(btnId);
+      if (loading) {
+        btn.disabled = true;
+        btn.innerHTML = `<span class="spinner"></span>Loading...`;
+      } else {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+
+    async function lookup() {
+      const email = document.getElementById('emailInput').value.trim();
+      if (!email) { showAlert('Please enter your email address.'); return; }
+
+      setLoading('lookupBtn', true, 'Look Up My Key');
+      document.getElementById('result').classList.remove('visible');
+
+      try {
+        const res = await fetch('/portal/lookup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email }),
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          showAlert(data.error || 'No subscription found for this email.');
+          return;
+        }
+
+        currentEmail = email;
+
+        // Populate result
+        document.getElementById('keyDisplay').textContent =
+          (data.key_prefix || 'wfapi-???') + '●●●●●●●●●●●●●●●●●●●●●●●●';
+
+        const rpm = data.rate_limit_per_minute;
+        document.getElementById('rateLimit').textContent =
+          rpm > 0 ? `${rpm} req/min` : 'Unlimited';
+
+        document.getElementById('createdAt').textContent =
+          data.created_at || '—';
+
+        const gwList = document.getElementById('gatewaysList');
+        const gws = data.allowed_gateways?.length ? data.allowed_gateways : ['All Gateways'];
+        gwList.innerHTML = gws.map(g => `<span class="gateway-chip">${g}</span>`).join('');
+
+        document.getElementById('result').classList.add('visible');
+        document.getElementById('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+      } catch (e) {
+        showAlert('Network error. Please try again.');
+      } finally {
+        setLoading('lookupBtn', false, 'Look Up My Key');
+      }
+    }
+
+    async function resend() {
+      if (!currentEmail) { showAlert('Please look up your email first.'); return; }
+      if (!confirm(`Regenerate your API key and send it to ${currentEmail}?\n\nYour current key will be revoked.`)) return;
+
+      setLoading('resendBtn', true, '🔄 Regenerate & Email New Key');
+
+      try {
+        const res = await fetch('/portal/resend', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: currentEmail }),
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          showAlert(data.error || 'Failed to regenerate key.');
+          return;
+        }
+        showAlert('✓ New key sent to your email! Check your inbox.', 'success');
+        document.getElementById('result').classList.remove('visible');
+        document.getElementById('keyDisplay').textContent = 'wfapi-????????...';
+
+      } catch (e) {
+        showAlert('Network error. Please try again.');
+      } finally {
+        setLoading('resendBtn', false, '🔄 Regenerate & Email New Key');
+      }
+    }
+
+    // Allow Enter key to trigger lookup
+    document.getElementById('emailInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter') lookup();
+    });
+  </script>
+</body>
+</html>

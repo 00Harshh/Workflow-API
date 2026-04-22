@@ -1,11 +1,11 @@
-# FlowGate Demo Testing Guide
+# Workflow API Demo Testing Guide
 
-This guide walks through a complete local demo of FlowGate without needing n8n, Zapier, Stripe live mode, or a VPS.
+This guide walks through a complete local demo of Workflow API without needing n8n, Zapier, Stripe live mode, or a VPS.
 
 You will test:
 
 - A mock workflow webhook
-- FlowGate proxying
+- Workflow API proxying
 - API key auth
 - Key scoping with `allowed_gateways`
 - Rate limiting
@@ -21,7 +21,7 @@ The demo uses three terminals.
 ## 0. Start From The Project Root
 
 ```bash
-cd /path/to/flowgate
+cd /path/to/workflow-api
 ```
 
 If you are using this current checkout:
@@ -41,10 +41,10 @@ pip install -r requirements.txt
 Optional shortcut:
 
 ```bash
-alias flowgate="python3 cli.py"
+alias workflow-api="python3 cli.py"
 ```
 
-If you do not use the alias, replace `flowgate` with `python3 cli.py`.
+If you do not use the alias, replace `workflow-api` with `python3 cli.py`.
 
 ---
 
@@ -128,9 +128,9 @@ Expected response:
 
 ---
 
-## 3. Terminal 2: Create A Demo FlowGate Config
+## 3. Terminal 2: Create A Demo Workflow API Config
 
-Run this from the FlowGate project root:
+Run this from the Workflow API project root:
 
 ```bash
 cat > config.yaml <<'YAML'
@@ -167,7 +167,7 @@ YAML
 Create a normal key that can access all workflows:
 
 ```bash
-flowgate key create --name DemoAll --rate-limit 60
+workflow-api key create --name DemoAll --rate-limit 60
 ```
 
 Copy the generated key. You will use it in Terminal 3.
@@ -175,7 +175,7 @@ Copy the generated key. You will use it in Terminal 3.
 Create a scoped key that can access only `demo`:
 
 ```bash
-flowgate key create --name DemoScoped --rate-limit 60 --gateways demo
+workflow-api key create --name DemoScoped --rate-limit 60 --gateways demo
 ```
 
 Copy that generated key too.
@@ -183,7 +183,7 @@ Copy that generated key too.
 List keys and confirm the scope column:
 
 ```bash
-flowgate key list
+workflow-api key list
 ```
 
 Expected:
@@ -195,15 +195,15 @@ DemoScoped   ... Scope demo
 
 ---
 
-## 4. Terminal 2: Start FlowGate
+## 4. Terminal 2: Start Workflow API
 
 ```bash
-flowgate start
+workflow-api start
 ```
 
 Leave this terminal running.
 
-FlowGate should start on:
+Workflow API should start on:
 
 ```text
 http://localhost:8000
@@ -216,17 +216,17 @@ http://localhost:8000
 First, export the keys you copied in Terminal 2:
 
 ```bash
-export FLOWGATE_ALL_KEY="wfapi-paste-your-demoall-key-here"
-export FLOWGATE_SCOPED_KEY="wfapi-paste-your-demoscoped-key-here"
+export WORKFLOW_API_ALL_KEY="wfapi-paste-your-demoall-key-here"
+export WORKFLOW_API_SCOPED_KEY="wfapi-paste-your-demoscoped-key-here"
 ```
 
 Use the all-access key:
 
 ```bash
 curl -i -X POST http://localhost:8000/run/demo \
-  -H "Authorization: Bearer $FLOWGATE_ALL_KEY" \
+  -H "Authorization: Bearer $WORKFLOW_API_ALL_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"message": "hello through FlowGate"}'
+  -d '{"message": "hello through Workflow API"}'
 ```
 
 Expected:
@@ -242,12 +242,12 @@ Response body should include:
   "ok": true,
   "workflow_path": "/webhook/demo",
   "received": {
-    "message": "hello through FlowGate"
+    "message": "hello through Workflow API"
   }
 }
 ```
 
-This proves FlowGate accepted the key and proxied the request to the mock workflow.
+This proves Workflow API accepted the key and proxied the request to the mock workflow.
 
 ---
 
@@ -290,7 +290,7 @@ The scoped key can call `demo`:
 
 ```bash
 curl -i -X POST http://localhost:8000/run/demo \
-  -H "Authorization: Bearer $FLOWGATE_SCOPED_KEY" \
+  -H "Authorization: Bearer $WORKFLOW_API_SCOPED_KEY" \
   -H "Content-Type: application/json" \
   -d '{"message": "allowed"}'
 ```
@@ -305,7 +305,7 @@ The same scoped key cannot call `private-demo`:
 
 ```bash
 curl -i -X POST http://localhost:8000/run/private \
-  -H "Authorization: Bearer $FLOWGATE_SCOPED_KEY" \
+  -H "Authorization: Bearer $WORKFLOW_API_SCOPED_KEY" \
   -H "Content-Type: application/json" \
   -d '{"message": "blocked"}'
 ```
@@ -329,13 +329,13 @@ Expected body:
 Create a low-limit key:
 
 ```bash
-flowgate key create --name DemoLimited --rate-limit 2 --gateways demo
+workflow-api key create --name DemoLimited --rate-limit 2 --gateways demo
 ```
 
 Copy the key:
 
 ```bash
-export FLOWGATE_LIMITED_KEY="wfapi-paste-your-demolimited-key-here"
+export WORKFLOW_API_LIMITED_KEY="wfapi-paste-your-demolimited-key-here"
 ```
 
 Send three quick requests:
@@ -344,7 +344,7 @@ Send three quick requests:
 for i in 1 2 3; do
   curl -s -o /dev/null -w "request $i -> %{http_code}\n" \
     -X POST http://localhost:8000/run/demo \
-    -H "Authorization: Bearer $FLOWGATE_LIMITED_KEY" \
+    -H "Authorization: Bearer $WORKFLOW_API_LIMITED_KEY" \
     -H "Content-Type: application/json" \
     -d "{\"request\": $i}"
 done
@@ -367,20 +367,20 @@ The exact result can vary slightly if enough time passes between requests, but t
 Create an already-expired key:
 
 ```bash
-flowgate key create --name ExpiredDemo --rate-limit 60 --expires-at 2000-01-01 --gateways demo
+workflow-api key create --name ExpiredDemo --rate-limit 60 --expires-at 2000-01-01 --gateways demo
 ```
 
 Copy the key:
 
 ```bash
-export FLOWGATE_EXPIRED_KEY="wfapi-paste-your-expireddemo-key-here"
+export WORKFLOW_API_EXPIRED_KEY="wfapi-paste-your-expireddemo-key-here"
 ```
 
-Call FlowGate:
+Call Workflow API:
 
 ```bash
 curl -i -X POST http://localhost:8000/run/demo \
-  -H "Authorization: Bearer $FLOWGATE_EXPIRED_KEY" \
+  -H "Authorization: Bearer $WORKFLOW_API_EXPIRED_KEY" \
   -H "Content-Type: application/json" \
   -d '{"message": "expired"}'
 ```
@@ -404,26 +404,26 @@ Expected body:
 Show the last 20 log entries:
 
 ```bash
-flowgate logs
+workflow-api logs
 ```
 
 Show only warnings:
 
 ```bash
-flowgate logs --level WARNING
+workflow-api logs --level WARNING
 ```
 
 Follow logs live:
 
 ```bash
-flowgate logs --follow
+workflow-api logs --follow
 ```
 
 While `logs --follow` is running, send another request from a different terminal:
 
 ```bash
 curl -X POST http://localhost:8000/run/demo \
-  -H "Authorization: Bearer $FLOWGATE_ALL_KEY" \
+  -H "Authorization: Bearer $WORKFLOW_API_ALL_KEY" \
   -H "Content-Type: application/json" \
   -d '{"message": "log follow test"}'
 ```
@@ -437,7 +437,7 @@ You should see a new JSON log line appear.
 Localhost can access stats without a key:
 
 ```bash
-curl http://localhost:8000/__flowgate/stats
+curl http://localhost:8000/__workflow-api/stats
 ```
 
 Expected shape:
@@ -457,7 +457,7 @@ Expected shape:
 Test admin header too:
 
 ```bash
-curl http://localhost:8000/__flowgate/stats \
+curl http://localhost:8000/__workflow-api/stats \
   -H "X-Admin-Key: demo-admin-secret"
 ```
 
@@ -468,7 +468,7 @@ curl http://localhost:8000/__flowgate/stats \
 Open:
 
 ```text
-http://localhost:8000/__flowgate/dashboard
+http://localhost:8000/__workflow-api/dashboard
 ```
 
 You should see:
@@ -517,7 +517,7 @@ whsec_...
 
 Copy it into `config.yaml` as `stripe.webhook_secret`.
 
-Restart FlowGate after editing `config.yaml`.
+Restart Workflow API after editing `config.yaml`.
 
 ### 13.3 Trigger Checkout Completion
 
@@ -528,8 +528,8 @@ stripe trigger checkout.session.completed
 Check logs:
 
 ```bash
-flowgate logs --level WARNING
-flowgate logs --level INFO
+workflow-api logs --level WARNING
+workflow-api logs --level INFO
 ```
 
 If the test event uses a Price ID that is not mapped, you will see:
@@ -538,7 +538,7 @@ If the test event uses a Price ID that is not mapped, you will see:
 stripe_price_unmapped
 ```
 
-Add that Price ID under `stripe.price_to_gateway`, restart FlowGate, and trigger again.
+Add that Price ID under `stripe.price_to_gateway`, restart Workflow API, and trigger again.
 
 When the mapping matches, `config.yaml` should get a new key with:
 
@@ -562,7 +562,7 @@ Note: Stripe CLI fixture events may not always share the same subscription ID be
 
 ## 14. Clean Up Demo State
 
-Stop FlowGate with `Ctrl+C`.
+Stop Workflow API with `Ctrl+C`.
 
 Stop the mock workflow server with `Ctrl+C`.
 
@@ -596,7 +596,7 @@ Use this checklist to confirm everything worked:
 - Scoped key returns `403` on `/run/private`.
 - Low-limit key returns `429` after quick repeated requests.
 - Expired key returns `403`.
-- `flowgate logs` shows structured JSON access logs.
-- `/__flowgate/stats` returns request counters.
-- `/__flowgate/dashboard` shows the read-only dashboard.
+- `workflow-api logs` shows structured JSON access logs.
+- `/__workflow-api/stats` returns request counters.
+- `/__workflow-api/dashboard` shows the read-only dashboard.
 - Optional Stripe test creates and revokes scoped keys.

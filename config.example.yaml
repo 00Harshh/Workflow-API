@@ -1,0 +1,33 @@
+workflows:
+  - name: my-workflow
+    endpoint: /run/my-workflow
+    target: http://localhost:5678/webhook-test/my-webhook
+    method: POST
+
+keys: []  # Managed by CLI: python3 cli.py keys create
+
+logging:
+  file: logs/usage.log
+
+storage:
+  backend: yaml        # "yaml" or "sqlite" (recommended for production)
+  sqlite_path: workflow-api.db
+
+email:
+  enabled: false
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  smtp_user: you@gmail.com
+  smtp_password: YOUR_APP_PASSWORD
+  from_address: noreply@yourapp.com
+  from_name: Workflow API
+
+stripe:
+  webhook_secret: whsec_YOUR_SECRET
+  api_key: sk_live_YOUR_KEY
+  rate_limit_per_minute: 60
+  price_to_gateway: {}
+
+server:
+  host: 0.0.0.0
+  port: 8000

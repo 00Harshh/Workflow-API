@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlowGate CLI
+Workflow API CLI
 Usage: python cli.py <command>
 """
 
@@ -42,7 +42,7 @@ CONFIG_PATH = Path("config.yaml")
 def print_banner():
     console.print()
     console.print(Panel.fit(
-        "[bold white]FlowGate[/bold white]  [dim]— turn any workflow into an API[/dim]",
+        "[bold white]Workflow API[/bold white]  [dim]— turn any workflow into an API[/dim]",
         border_style="dim"
     ))
     console.print()
@@ -135,7 +135,7 @@ def _print_next_steps(endpoint: str, key: str, port: int):
     console.print(Panel(
         "[bold]Next steps[/bold]\n\n"
         "1. Keep your n8n Webhook node on [cyan]Listen for test event[/cyan].\n"
-        f"2. Start FlowGate:\n   [cyan]python3 cli.py start[/cyan]\n\n"
+        f"2. Start Workflow API:\n   [cyan]python3 cli.py start[/cyan]\n\n"
         "3. In a second terminal, test it:\n"
         f"   [cyan]curl -X POST http://localhost:{port}{endpoint} \\\\[/cyan]\n"
         f"   [cyan]  -H \"Authorization: Bearer {key}\" \\\\[/cyan]\n"
@@ -222,7 +222,7 @@ def _follow_log_file(path: Path, level: str | None):
 
 @click.group()
 def cli():
-    """FlowGate — API layer for your workflows."""
+    """Workflow API — API layer for your workflows."""
     pass
 
 
@@ -230,9 +230,9 @@ def cli():
 
 @cli.command("n8n")
 @click.option("--url", "webhook_url", help="Your n8n webhook URL, e.g. http://localhost:5678/webhook-test/n8ntest.")
-@click.option("--name", default="n8ntest", show_default=True, help="FlowGate workflow/gateway name.")
-@click.option("--endpoint", default=None, help="Public FlowGate endpoint. Defaults to /run/<name>.")
-@click.option("--port", default=8000, show_default=True, type=click.IntRange(1, 65535), help="FlowGate server port.")
+@click.option("--name", default="n8ntest", show_default=True, help="Workflow API workflow/gateway name.")
+@click.option("--endpoint", default=None, help="Public Workflow API endpoint. Defaults to /run/<name>.")
+@click.option("--port", default=8000, show_default=True, type=click.IntRange(1, 65535), help="Workflow API server port.")
 @click.option("--key-name", default="Test", show_default=True, help="Name for the generated API key.")
 @click.option("--rate-limit", default=60, show_default=True, type=int, help="Requests per minute for the generated key.")
 @click.option("--force", is_flag=True, help="Overwrite config.yaml without asking.")
@@ -349,8 +349,15 @@ def init():
 # ── start ──────────────────────────────────────────────────────────────────────
 
 @cli.command()
-@click.option("--port", default=None, type=int, help="Override port from config")
-def start(port):
+@click.option("--port", default=None, type=int, help="Override port from config.")
+@click.option(
+    "--workers",
+    default=1,
+    show_default=True,
+    type=click.IntRange(1, 32),
+    help="Number of uvicorn worker processes. Use >1 for production. Redis recommended for accurate rate-limiting across workers.",
+)
+def start(port, workers):
     """Start the API server."""
     require_config()
 
@@ -360,7 +367,7 @@ def start(port):
 
     console.print()
     console.print(Panel.fit(
-        "[bold white]FlowGate[/bold white] starting...",
+        "[bold white]Workflow API[/bold white] starting...",
         border_style="dim"
     ))
 
@@ -374,13 +381,32 @@ def start(port):
         console.print(f"  [green]→[/green] [bold]{wf['endpoint']}[/bold]  [dim]→  {wf['target']}[/dim]")
 
     server_port = port or cfg.get("server", {}).get("port", 8000)
+    server_host = cfg.get("server", {}).get("host", "0.0.0.0")
     console.print()
+    console.print(f"  [dim]Workers:[/dim]       {workers}")
     console.print(f"  [dim]Listening on[/dim] http://0.0.0.0:{server_port}")
     console.print(f"  [dim]Docs:[/dim]          http://localhost:{server_port}/docs")
     console.print()
 
-    # Hand off to uvicorn
-    subprocess.run([sys.executable, "main.py"])
+    if workers > 1:
+        import os as _os
+        redis_url = _os.environ.get("REDIS_URL", "")
+        if not redis_url:
+            console.print(
+                "[yellow]⚠[/yellow]  Multiple workers without REDIS_URL set.\n"
+                "   Rate limits will be per-worker (not global). "
+                "Set [cyan]REDIS_URL=redis://localhost:6379[/cyan] for accurate limiting.\n"
+            )
+        # uvicorn --workers requires passing the app as a string import path
+        subprocess.run([
+            sys.executable, "-m", "uvicorn", "main:app",
+            "--host", server_host,
+            "--port", str(server_port),
+            "--workers", str(workers),
+        ])
+    else:
+        # Single worker: run main.py directly (preserves startup prints)
+        subprocess.run([sys.executable, "main.py"])
 
 
 # ── status ─────────────────────────────────────────────────────────────────────
@@ -449,7 +475,7 @@ def status():
 @click.option("--level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), help="Only show logs with this severity.")
 @click.option("--lines", default=20, show_default=True, type=int, help="Number of matching log lines to print before exiting or following.")
 def logs(follow, level, lines):
-    """Show FlowGate access logs."""
+    """Show Workflow API access logs."""
     log_path = get_log_path()
     normalized_level = level.upper() if level else None
 
@@ -545,7 +571,7 @@ def keys_list():
             _format_scope(k),
             _format_expiration(k),
             k.get("created_at", "-"),
-            k["key"][:28] + "...",
+            (k.get("key_prefix") or k.get("key", "")[:16]) + "...",
         )
 
     console.print(table)
@@ -571,6 +597,68 @@ def keys_revoke(name):
 
 # Singular alias: `python cli.py key create` works the same as `python cli.py keys create`.
 cli.add_command(keys, "key")
+
+
+# ── migrate ───────────────────────────────────────────────────────────────────
+
+@cli.group("migrate")
+def migrate():
+    """Data migration utilities."""
+    pass
+
+
+@migrate.command("hash-keys")
+def migrate_hash_keys():
+    """
+    Replace plaintext API keys in config.yaml with SHA-256 hashes (in-place).
+    Safe to run multiple times. Existing keys keep working after migration.
+    """
+    require_config()
+    console.print()
+    from core.auth import migrate_keys_to_hashed
+    n = migrate_keys_to_hashed()
+    if n:
+        console.print(f"[green]✓[/green] Hashed [bold]{n}[/bold] key(s) in config.yaml")
+    else:
+        console.print("[dim]All keys are already hashed. Nothing to do.[/dim]")
+    console.print()
+
+
+@migrate.command("yaml-to-sqlite")
+@click.option("--sqlite-path", default="workflow-api.db", show_default=True, help="SQLite DB path.")
+@click.option("--switch", is_flag=True, help="Also update config.yaml storage.backend to sqlite.")
+def migrate_yaml_to_sqlite(sqlite_path, switch):
+    """
+    Copy all keys from config.yaml into a SQLite database.
+    Use --switch to automatically change storage.backend to sqlite.
+    """
+    require_config()
+    console.print()
+
+    from core.auth import migrate_yaml_to_sqlite as _migrate, load_config, save_config
+
+    n = _migrate(sqlite_path)
+    console.print(f"[green]✓[/green] Migrated [bold]{n}[/bold] key(s) to SQLite: [cyan]{sqlite_path}[/cyan]")
+
+    if switch:
+        cfg = load_config()
+        if "storage" not in cfg or cfg["storage"] is None:
+            cfg["storage"] = {}
+        cfg["storage"]["backend"] = "sqlite"
+        cfg["storage"]["sqlite_path"] = sqlite_path
+        save_config(cfg)
+        console.print(f"[green]✓[/green] config.yaml updated: storage.backend = sqlite")
+        console.print("[dim]Restart Workflow API for the change to take effect.[/dim]")
+    else:
+        console.print()
+        console.print(Panel(
+            f"Keys copied. To switch to SQLite, either:\n"
+            f"  Run: [cyan]python cli.py migrate yaml-to-sqlite --switch[/cyan]\n"
+            f"  Or set [cyan]storage.backend: sqlite[/cyan] in config.yaml, then restart.",
+            border_style="dim",
+            expand=False,
+        ))
+    console.print()
 
 
 # ── entry ──────────────────────────────────────────────────────────────────────

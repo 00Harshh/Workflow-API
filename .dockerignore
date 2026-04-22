@@ -1,0 +1,33 @@
+# Fix #12: Prevent secrets and runtime data from being baked into Docker image.
+# Use environment variables or mounted volumes for config at runtime.
+
+# ── Secrets — never bake into image ──────────────────────────────────────────
+config.yaml
+.env
+.env.*
+resend_cooldown.json
+
+# ── Database ──────────────────────────────────────────────────────────────────
+workflow-api.db
+workflow-api.db-wal
+workflow-api.db-shm
+*.lock
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Python ────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# ── Git / OS / IDE ────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

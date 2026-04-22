@@ -1,5 +1,20 @@
+"""
+core/auth.py — Authentication, key management, and config utilities.
+
+Key hashing: API keys are stored as SHA-256 hashes. The raw key is only
+visible at creation time. Auth compares hash(incoming_token) against the
+stored hash — constant-time comparison is not needed here because dictionary
+lookup is already indexed by hash, not compared in a loop.
+
+Storage: all key operations delegate to core.store.get_store() so the
+backend (YAML or SQLite) is transparent to callers.
+"""
+from __future__ import annotations
+
+import hashlib
 import secrets
 import re
+import threading
 from pathlib import Path
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -11,10 +26,19 @@ yaml = YAML()
 yaml.preserve_quotes = True
 yaml.indent(mapping=2, sequence=4, offset=2)
 
+# ── Config cache ───────────────────────────────────────────────────────────────
+# Avoids re-parsing config.yaml on every request.
+# Invalidated whenever the file's mtime changes on disk.
+_config_cache: dict | None = None
+_config_mtime: float = -1.0
+_config_lock = threading.Lock()
+
 
 class ExpiredKeyError(Exception):
     """Raised when an otherwise valid API key is past its expiration time."""
 
+
+# ── Date / time utilities ──────────────────────────────────────────────────────
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -28,7 +52,6 @@ def _parse_duration(value: str) -> timedelta:
     match = re.fullmatch(r"\+?(\d+)([dhm])", value.strip().lower())
     if not match:
         raise ValueError("Use a relative expiration like 30d, +30d, 12h, or 45m.")
-
     amount = int(match.group(1))
     unit = match.group(2)
     if unit == "d":
@@ -43,7 +66,6 @@ def _parse_datetime(value: str) -> datetime:
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         parsed_date = datetime.strptime(text, "%Y-%m-%d").date()
         return datetime.combine(parsed_date, time(23, 59, 59), tzinfo=timezone.utc)
-
     normalized = text.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None:
@@ -51,7 +73,9 @@ def _parse_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def parse_expiration(*, expires_at: str | None = None, expires_in: str | None = None) -> str | None:
+def parse_expiration(
+    *, expires_at: str | None = None, expires_in: str | None = None
+) -> str | None:
     """Returns an ISO 8601 UTC expiration string, or None for immortal keys."""
     if expires_at and expires_in:
         raise ValueError("Use either --expires-at or --expires-in, not both.")
@@ -81,37 +105,55 @@ def is_key_expired(key_record: dict, now: datetime | None = None) -> bool:
     expires_at = key_record.get("expires_at")
     if not expires_at:
         return False
-
     try:
         expires_dt = _coerce_expiration(expires_at)
     except (TypeError, ValueError):
         return True
-
     return (now or _utc_now()) > expires_dt
 
 
-def count_active_keys() -> int:
-    return sum(1 for key in get_all_keys() if not is_key_expired(key))
-
+# ── Config I/O ────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
-    with open(CONFIG_PATH, "r") as f:
-        return yaml.load(f) or {}
+    """Load config, returning the cached version if the file hasn't changed."""
+    global _config_cache, _config_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except FileNotFoundError:
+        raise
+    with _config_lock:
+        if _config_cache is not None and mtime == _config_mtime:
+            return _config_cache
+        with open(CONFIG_PATH, "r") as f:
+            fresh = yaml.load(f) or {}
+        _config_cache = fresh
+        _config_mtime = mtime
+        return fresh
 
 
-def save_config(config: dict):
+def save_config(config: dict) -> None:
+    """Persist config to disk and immediately update the in-memory cache."""
+    global _config_cache, _config_mtime
     with open(CONFIG_PATH, "w") as f:
         yaml.dump(config, f)
+    with _config_lock:
+        _config_cache = config
+        try:
+            _config_mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            _config_mtime = -1.0
 
+
+# ── Gateway helpers ───────────────────────────────────────────────────────────
 
 def get_gateways(config: dict | None = None) -> list[dict]:
-    """Returns configured gateways, accepting legacy `workflows` configs."""
+    """Returns configured gateways; accepts legacy `workflows` key."""
     config = config or load_config()
     return config.get("gateways") or config.get("workflows") or []
 
 
 def get_gateway_names(config: dict | None = None) -> set[str]:
-    return {gateway["name"] for gateway in get_gateways(config) if gateway.get("name")}
+    return {gw["name"] for gw in get_gateways(config) if gw.get("name")}
 
 
 def parse_allowed_gateways(value: str | list[str] | tuple[str, ...] | None) -> list[str] | None:
@@ -124,16 +166,18 @@ def parse_allowed_gateways(value: str | list[str] | tuple[str, ...] | None) -> l
     return names or None
 
 
-def validate_allowed_gateways(allowed_gateways: list[str] | None, config: dict | None = None):
+def validate_allowed_gateways(
+    allowed_gateways: list[str] | None, config: dict | None = None
+) -> None:
     if not allowed_gateways:
         return
-
     available = get_gateway_names(config)
     unknown = sorted(set(allowed_gateways) - available)
     if unknown:
         available_text = ", ".join(sorted(available)) or "none configured"
-        unknown_text = ", ".join(unknown)
-        raise ValueError(f"Unknown gateway(s): {unknown_text}. Available gateways: {available_text}.")
+        raise ValueError(
+            f"Unknown gateway(s): {', '.join(unknown)}. Available: {available_text}."
+        )
 
 
 def key_allowed_for_gateway(key_record: dict, gateway_name: str) -> bool:
@@ -143,23 +187,36 @@ def key_allowed_for_gateway(key_record: dict, gateway_name: str) -> bool:
     return gateway_name in allowed_gateways
 
 
+# ── Key hashing ───────────────────────────────────────────────────────────────
+
+def hash_key(raw_key: str) -> str:
+    """SHA-256 digest of a raw API key. Stored instead of the plaintext key."""
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+# ── Key CRUD — delegates to store ────────────────────────────────────────────
+
 def get_all_keys() -> list[dict]:
-    config = load_config()
-    return config.get("keys") or []
+    from core.store import get_store  # lazy — avoids circular import at module load
+    return get_store().get_all_keys()
+
+
+def count_active_keys() -> int:
+    from core.store import get_store
+    return get_store().count_active_keys()
 
 
 def find_key(raw_key: str) -> dict | None:
-    """Returns the key record if valid, None if not found."""
-    for k in get_all_keys():
-        if secrets.compare_digest(k["key"], raw_key):
-            return k
-    return None
+    """Look up a key record by its raw (Bearer) value."""
+    from core.store import get_store
+    return get_store().find_key_by_hash(hash_key(raw_key))
 
 
 def validate_and_resolve(authorization: str | None) -> dict | None:
     """
     Validates the Authorization header.
-    Returns the key record (including rate_limit) if valid, else None.
+    Returns the key record if valid, None if not found.
+    Raises ExpiredKeyError if the key exists but is past its expiration.
     """
     if not authorization:
         return None
@@ -178,18 +235,20 @@ def create_key(
     expires_at: str | None = None,
     allowed_gateways: list[str] | None = None,
     stripe_subscription_id: str | None = None,
+    email: str | None = None,
 ) -> dict:
-    """Generates a new key, saves it to config, and returns the record."""
-    config = load_config()
-    if "keys" not in config or config["keys"] is None:
-        config["keys"] = []
-
-    validate_allowed_gateways(allowed_gateways, config)
+    """
+    Generate a new API key, persist it (hashed) to the store, and return the
+    full record — including the raw key which is only available at this moment.
+    """
+    from core.store import get_store
+    validate_allowed_gateways(allowed_gateways)
 
     raw = "wfapi-" + secrets.token_urlsafe(32)
-    record = {
+    record: dict = {
         "name": name,
-        "key": raw,
+        "key_hash": hash_key(raw),
+        "key_prefix": raw[:16],
         "rate_limit_per_minute": rate_limit_per_minute,
         "created_at": _utc_now().strftime("%Y-%m-%d"),
         "expires_at": expires_at,
@@ -197,41 +256,95 @@ def create_key(
     }
     if stripe_subscription_id:
         record["stripe_subscription_id"] = stripe_subscription_id
+    if email:
+        record["email"] = email.strip().lower()
 
-    config["keys"].append(record)
-    save_config(config)
-    return record
+    get_store().create_key(record)
+
+    # Return record + raw key (caller must display it now — it won't be stored)
+    return {**record, "key": raw}
 
 
 def find_key_by_stripe_subscription(subscription_id: str) -> dict | None:
-    for key_record in get_all_keys():
-        if key_record.get("stripe_subscription_id") == subscription_id:
-            return key_record
-    return None
+    from core.store import get_store
+    return get_store().find_key_by_stripe_subscription(subscription_id)
 
 
 def revoke_key_by_stripe_subscription(subscription_id: str) -> bool:
-    config = load_config()
-    keys = config.get("keys") or []
-    before = len(keys)
-    config["keys"] = [
-        key_record
-        for key_record in keys
-        if key_record.get("stripe_subscription_id") != subscription_id
-    ]
-    if len(config["keys"]) < before:
-        save_config(config)
-        return True
-    return False
+    from core.store import get_store
+    return get_store().revoke_key_by_stripe_subscription(subscription_id)
 
 
 def revoke_key(name: str) -> bool:
     """Removes all keys with the given name. Returns True if any were removed."""
+    from core.store import get_store
+    return get_store().revoke_key(name)
+
+
+# ── Migration utilities ───────────────────────────────────────────────────────
+
+def migrate_keys_to_hashed() -> int:
+    """
+    Scan config.yaml for plaintext `key` fields and replace them with
+    `key_hash` + `key_prefix` in-place. Safe to run multiple times.
+    Returns the number of keys migrated.
+    """
     config = load_config()
     keys = config.get("keys") or []
-    before = len(keys)
-    config["keys"] = [k for k in keys if k["name"] != name]
-    if len(config["keys"]) < before:
+    migrated = 0
+    for k in keys:
+        if "key" in k and "key_hash" not in k:
+            raw = k.pop("key")
+            k["key_hash"] = hash_key(raw)
+            k["key_prefix"] = raw[:16]
+            migrated += 1
+        elif "key" in k and "key_hash" in k:
+            # Remove redundant plaintext copy
+            k.pop("key")
+            migrated += 1
+    if migrated:
         save_config(config)
-        return True
-    return False
+    return migrated
+
+
+def migrate_yaml_to_sqlite(sqlite_path: str = "workflow-api.db") -> int:
+    """
+    Copy all keys from config.yaml into a SQLite database.
+    Returns the number of keys successfully migrated.
+    """
+    from core.store_sqlite import SQLiteKeyStore
+    sqlite_store = SQLiteKeyStore(sqlite_path)
+    config = load_config()
+    keys = config.get("keys") or []
+    migrated = 0
+
+    for k in keys:
+        raw_key = k.get("key")
+        key_hash = k.get("key_hash")
+        if raw_key and not key_hash:
+            key_hash = hash_key(raw_key)
+        if not key_hash:
+            continue
+
+        allowed = k.get("allowed_gateways")
+        if isinstance(allowed, str):
+            allowed = [g.strip() for g in allowed.split(",") if g.strip()]
+
+        record = {
+            "name": k.get("name", "unknown"),
+            "key_hash": key_hash,
+            "key_prefix": (k.get("key") or key_hash)[:16],
+            "rate_limit_per_minute": k.get("rate_limit_per_minute", 60),
+            "created_at": k.get("created_at", _utc_now().strftime("%Y-%m-%d")),
+            "expires_at": k.get("expires_at"),
+            "allowed_gateways": allowed,
+            "stripe_subscription_id": k.get("stripe_subscription_id"),
+            "email": k.get("email"),
+        }
+        try:
+            sqlite_store.create_key(record)
+            migrated += 1
+        except Exception:
+            pass  # already exists — skip duplicate
+
+    return migrated

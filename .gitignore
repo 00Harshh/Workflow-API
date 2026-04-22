@@ -1,4 +1,32 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# ── SECRETS — never commit these ─────────────────────────
+# config.yaml contains api key hashes, SMTP creds, Stripe keys.
+# Commit config.example.yaml instead (see below).
+config.yaml
+.env
+.env.*
+
+# ── Database ──────────────────────────────────────────────
+workflow-api.db
+workflow-api.db-wal
+workflow-api.db-shm
+*.lock
+
+# ── Logs ──────────────────────────────────────────────────
+logs/usage.log
 logs/stripe_events.json
+logs/*.log
+
+# ── OS / IDE ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
