@@ -1,3 +1,10 @@
+```text
+ __      __         _  __  __               _    ___ ___  ___ 
+ \ \    / /__ _ _ _| |/ _|/ /_____ __ __   /_\  | _ \_ _|
+  \ \/\/ / _ \ '_| |  _| | / _ \ V  V /  / _ \ |  _/ | | 
+   \_/\_/\___/_| |_|_| |_|_\___/\_/\_/  /_/ \_\|_|  |___|
+```
+
 # Workflow API
 
 Turn any HTTP workflow into a protected, rate-limited, monetizable API.
