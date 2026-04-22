@@ -21,7 +21,7 @@ Workflow API is a small self-hosted gateway for n8n, Zapier, custom scripts, or 
 
 Workflow API does not run your workflow, process payments, or require a database. Everything lives in `config.yaml` and `logs/`.
 
-Want a local dry run first? Follow [DEMO_TESTING.md](DEMO_TESTING.md) to test Workflow API end to end with a mock webhook server.
+
 
 ---
 
