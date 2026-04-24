@@ -30,10 +30,16 @@ from core.security import validate_target_url, get_real_client_ip  # Fix #1, #2,
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise storage, start background log writer; tear down cleanly."""
+    """Initialise storage, start background workers; tear down cleanly."""
+    from core.cancellation_scheduler import start as start_cancellation_poller
+    from core.cancellation_scheduler import shutdown as stop_cancellation_poller
+
     get_store()                                          # warm up storage singleton
     log_task = asyncio.create_task(start_log_writer())  # async log queue writer
+    await start_cancellation_poller()                    # grace-period poller
     yield
+    # ── Teardown ──────────────────────────────────────────────────────────────
+    await stop_cancellation_poller()
     log_task.cancel()
     try:
         await log_task
@@ -296,20 +302,23 @@ async def stripe_webhook(request: Request):
         return JSONResponse({"detail": "Invalid Stripe payload"}, status_code=400)
     except stripe.error.SignatureVerificationError:
         log_request(
-            "/webhooks/stripe", 400, 0,
+            "/webhooks/stripe", 401, 0,
             gateway="stripe", event="stripe_signature_failed", level="WARNING",
         )
-        return JSONResponse({"detail": "Invalid Stripe signature"}, status_code=400)
+        return JSONResponse({"detail": "Invalid Stripe signature"}, status_code=401)
 
     try:
         result = await process_event(event)
     except Exception as exc:
+        # Log full error internally — never expose to caller
         log_request(
             "/webhooks/stripe", 500, 0,
-            gateway="stripe", event="stripe_processing_error", level="ERROR",
+            gateway="stripe",
+            event=f"stripe_processing_error:{type(exc).__name__}",
+            level="ERROR",
         )
         return JSONResponse(
-            {"detail": f"Stripe webhook processing failed: {exc}"}, status_code=500
+            {"detail": "Webhook processing error."}, status_code=500
         )
 
     return JSONResponse(result)

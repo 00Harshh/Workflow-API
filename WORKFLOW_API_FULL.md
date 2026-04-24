@@ -1,6 +1,6 @@
 # Workflow API — Full Project Document
 
-> From problem statement to architecture to future roadmap.
+> From problem statement to architecture to production deployment.
 
 ---
 
@@ -25,7 +25,7 @@ The existing options all fail in some way:
 | Build a FastAPI wrapper yourself | Requires backend knowledge |
 | Use a cloud API gateway (AWS, Cloudflare) | Complex setup, ongoing cost, vendor lock-in |
 
-**The gap:** there is no lightweight, self-hosted, zero-infrastructure tool that turns an existing workflow into a properly authenticated, rate-limited, multi-tenant API.
+**The gap:** there is no lightweight, self-hosted, zero-infrastructure tool that turns an existing workflow into a properly authenticated, rate-limited, multi-tenant, monetizable API.
 
 ---
 
@@ -33,17 +33,19 @@ The existing options all fail in some way:
 
 Workflow API is a thin auth + proxy layer that sits between the outside world and a user's existing workflow.
 
-It does exactly four things:
+It does these things:
 
-1. Validates API keys on every incoming request
-2. Enforces per-key rate limits
-3. Forwards the request to the user's workflow URL
-4. Logs the request with tier and latency
+1. Validates API keys on every incoming request (SHA-256 hashed, timing-attack-safe)
+2. Enforces per-key rate limits (token bucket algorithm)
+3. Forwards the request to the user's workflow URL (async httpx proxy)
+4. Logs the request with tier and latency (async queue, never blocks)
+5. Automates subscription key lifecycle via Stripe webhook integration
+6. Enforces security at every layer: HMAC verification, SSRF protection, env-only secrets
 
 It does not host workflows. It does not run compute. It does not touch billing. It is a layer — not a platform.
 
 **One-line definition:**
-> An open-source CLI tool that wraps any HTTP-accessible workflow in a production-ready API with key auth, per-user rate limiting, and a monetization flow.
+> An open-source CLI tool that wraps any HTTP-accessible workflow in a production-ready API with key auth, per-user rate limiting, Stripe subscription automation, and a monetization flow.
 
 ---
 
@@ -65,9 +67,13 @@ Each API key has its own isolated token bucket. A Free tier user hitting their l
 
 Workflow API does not transform requests or responses. It strips auth headers, forwards the body as-is to the target URL, and returns whatever the workflow returns. No schema enforcement, no data manipulation. This keeps it compatible with anything.
 
-### 3.5 No database
+### 3.5 Dual storage backends, protocol-driven
 
-All state lives in `config.yaml` (keys, workflows, server config) and `logs/usage.log` (flat JSON lines). No Postgres, no Redis, no external dependencies. This keeps setup under 5 minutes.
+State lives in either `config.yaml` (YAML backend) or `workflow-api.db` (SQLite backend). Both implement the `KeyStore` protocol identically — switching backends is a one-command migration with zero code changes. SQLite (WAL mode) is recommended for production multi-worker deployments.
+
+### 3.6 Secrets never in version control
+
+The Stripe webhook secret is loaded **exclusively** from `STRIPE_WEBHOOK_SECRET` env var. `config.yaml` is gitignored. `.env` files are gitignored. Only `config.example.yaml` (with placeholder values) is committed.
 
 ---
 
@@ -82,8 +88,14 @@ External Caller
       │  Authorization: Bearer wfapi-xxx
       ▼
 ┌─────────────────────┐
-│    Auth Layer       │  → validates key against config.yaml
-│    (core/auth.py)   │  → resolves key record (name, rate limit)
+│  HMAC / Admin Auth  │  → Stripe: verify Stripe-Signature header
+│    (main.py)        │  → Admin: secrets.compare_digest
+└────────┬────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│    Auth Layer       │  → SHA-256 hash Bearer token
+│    (core/auth.py)   │  → lookup in store → resolve key record
 └────────┬────────────┘
          │  key record
          ▼
@@ -94,8 +106,14 @@ External Caller
          │  allowed
          ▼
 ┌─────────────────────┐
-│   Proxy Engine      │  → strips auth headers
-│   (core/proxy.py)   │  → forwards body + query params to target URL
+│   SSRF Guard        │  → validate target URL
+│  (core/security.py) │  → block private IPs, cloud metadata
+└────────┬────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│   Proxy Engine      │  → strip auth headers
+│   (core/proxy.py)   │  → forward body + query params via httpx
 └────────┬────────────┘
          │
          ▼
@@ -104,69 +122,86 @@ External Caller
          │
          ▼
 ┌─────────────────────┐
-│   Logger            │  → writes timestamp, endpoint, tier, status, latency
-│   (core/logger.py)  │  → to logs/usage.log
+│   Logger            │  → asyncio.Queue.put_nowait() — ~0.001ms
+│   (core/logger.py)  │  → background writer → logs/usage.log
 └─────────────────────┘
          │
          ▼
   Response returned to caller
 ```
 
-### 4.2 File Structure
+### 4.2 Stripe Webhook Flow
+
+```
+POST /webhooks/stripe
+  │
+  ├─ construct_event() → stripe.Webhook.construct_event(body, sig, STRIPE_WEBHOOK_SECRET)
+  │    HMAC mismatch → 401 Unauthorized
+  │    Secret missing → 503 Service Unavailable
+  │
+  ├─ is_event_processed(event.id) → deduplicate retries
+  │
+  ├─ checkout.session.completed
+  │    → extract price_id → map to allowed_gateways
+  │    → create_key() → hash + store
+  │    → async_send_api_key_email() → SMTP
+  │
+  ├─ customer.subscription.deleted
+  │    → schedule_revocation() → write pending_cancellation to DB
+  │    → key stays ACTIVE (48h grace window)
+  │
+  └─ customer.subscription.created / invoice.payment_succeeded
+       → cancel_pending_revocation() → delete pending record
+       → key stays active ✅
+```
+
+### 4.3 Grace Period Architecture
+
+```
+Background poller (asyncio.Task, started in lifespan):
+  → runs every CANCELLATION_POLL_SECONDS (default: 60s)
+  → calls get_due_cancellations() → DB rows where revoke_at <= now()
+  → for each: revoke_key_by_stripe_subscription() + remove_pending_cancellation()
+  → SQLite WAL: only one writer commits; DELETE is idempotent across workers
+```
+
+State is in the **database**, not in memory — survives server restarts, works across multiple uvicorn workers.
+
+### 4.4 File Structure
 
 ```
 workflow-api/
 │
-├── cli.py                ← primary interface for the user
-├── main.py               ← FastAPI server, registers routes from config
-├── keygen.py             ← (legacy) replaced by cli.py keys
-├── config.yaml           ← single source of truth, managed by CLI
+├── cli.py                ← primary CLI interface
+├── main.py               ← FastAPI server, routes, lifespan hooks
+├── config.yaml           ← single source of truth (gitignored)
+├── config.example.yaml   ← safe template for version control
 │
 ├── core/
-│   ├── auth.py           ← key CRUD, validation, resolution
-│   ├── proxy.py          ← async HTTP forwarding via httpx
-│   ├── limiter.py        ← token bucket, per-key, singleton instance
-│   └── logger.py         ← flat JSON line writer
+│   ├── auth.py           ← key CRUD, validation, SHA-256 hashing
+│   ├── cancellation_scheduler.py  ← 48h grace period poller
+│   ├── store.py          ← KeyStore protocol + singleton factory
+│   ├── store_sqlite.py   ← SQLite backend (WAL mode)
+│   ├── store_yaml.py     ← YAML backend (fcntl file locking)
+│   ├── limiter.py        ← token bucket, per-key, singleton
+│   ├── logger.py         ← async queue log writer
+│   ├── proxy.py          ← httpx async request forwarder
+│   ├── security.py       ← SSRF protection, IP extraction
+│   ├── email_sender.py   ← SMTP with Jinja2 HTML template
+│   └── stripe_webhooks.py ← Stripe event processor
+│
+├── templates/
+│   └── dashboard.html    ← Admin dashboard (Chart.js, glassmorphism)
 │
 ├── logs/
 │   └── usage.log         ← one JSON object per request
 │
-├── Dockerfile            ← for VPS / live deployment
-├── requirements.txt
-└── README.md
+├── nginx.conf            ← drop-in reverse proxy config
+├── Dockerfile
+└── requirements.txt
 ```
 
-### 4.3 Config Structure
-
-```yaml
-workflows:
-  - name: summarize
-    endpoint: /run/summarize
-    target: http://localhost:5678/webhook/abc123
-    method: POST
-
-keys:
-  - name: Free
-    key: wfapi-xxxxxxxxxxxxxxxx
-    rate_limit_per_minute: 10
-    created_at: "2026-04-21"
-
-  - name: Pro
-    key: wfapi-yyyyyyyyyyyyyyyy
-    rate_limit_per_minute: 200
-    created_at: "2026-04-21"
-
-  - name: Enterprise
-    key: wfapi-zzzzzzzzzzzzzzzz
-    rate_limit_per_minute: 0     # 0 = unlimited
-    created_at: "2026-04-21"
-
-server:
-  host: "0.0.0.0"
-  port: 8000
-```
-
-### 4.4 Rate Limiter Design
+### 4.5 Rate Limiter Design
 
 Token bucket algorithm. Each key gets its own bucket:
 
@@ -179,14 +214,14 @@ Token bucket algorithm. Each key gets its own bucket:
 
 The limiter is a singleton instantiated once at server startup and shared across all requests.
 
-### 4.5 Auth Design
+### 4.6 Auth Design
 
-- Keys stored in plain text in `config.yaml` (user controls their own security)
-- Validation uses `secrets.compare_digest` to prevent timing attacks
-- `validate_and_resolve()` returns the full key record on success — the rate limiter reads `rate_limit_per_minute` directly from it
-- Key generation uses `secrets.token_urlsafe(32)` prefixed with `wfapi-`
+- Keys hashed with SHA-256 before storage. Only `key_hash` + `key_prefix` (first 16 chars) are persisted.
+- Bearer token on each request is hashed and compared via direct equality (constant-time via hash comparison).
+- Admin endpoint uses `secrets.compare_digest` explicitly to prevent timing attacks.
+- Key generation uses `secrets.token_urlsafe(33)` prefixed with `wfapi-`.
 
-### 4.6 Proxy Design
+### 4.7 Proxy Design
 
 Built on `httpx` async client:
 
@@ -201,16 +236,21 @@ Built on `httpx` async client:
 
 ## 5. CLI Reference
 
-The entire user-facing interface. Users never touch `config.yaml` or `main.py` directly.
+The entire user-facing management interface.
 
 ```
-python cli.py init              First-time setup wizard
-python cli.py start             Start the API server
-python cli.py status            Show all workflows + active keys
+python3 cli.py init              First-time setup wizard
+python3 cli.py start             Start the API server
+python3 cli.py start --workers 4 Multi-worker production start
+python3 cli.py status            Show all workflows + active keys
 
-python cli.py keys create       Interactive: name + rate limit → new key
-python cli.py keys list         Table of all active keys
-python cli.py keys revoke Pro   Revoke all keys named 'Pro'
+python3 cli.py keys create       Create a new API key
+python3 cli.py keys list         Table of all active keys
+python3 cli.py keys revoke Pro   Revoke all keys named 'Pro'
+
+python3 cli.py n8n --url ...     One-command n8n workflow setup
+python3 cli.py migrate hash-keys  Migrate plaintext keys → SHA-256 hashes
+python3 cli.py migrate yaml-to-sqlite  Migrate YAML store → SQLite
 ```
 
 ### Init wizard flow
@@ -227,7 +267,7 @@ python cli.py keys revoke Pro   Revoke all keys named 'Pro'
    Rate limit (req/min)?   → 30
 ```
 
-Writes `config.yaml`, prints the generated key, and shows next steps.
+Writes `config.yaml`, prints the generated key (once only), and shows next steps.
 
 ---
 
@@ -235,29 +275,45 @@ Writes `config.yaml`, prints the generated key, and shows next steps.
 
 Workflow API does not own the billing layer. It provides the infrastructure that makes billing possible.
 
-The intended flow for a workflow creator:
+**Automated flow (Stripe):**
 
 ```
-User pays (Stripe / Gumroad / manual invoice / anything)
+User visits Stripe Payment Link
     ↓
-Creator runs: python cli.py keys create
-    Name: Pro
-    Rate limit: 200
+User pays subscription
     ↓
-Key is printed once. Creator copies and sends to user.
+Stripe fires checkout.session.completed
+    ↓
+Workflow API: HMAC verify → create key → email to customer
+    ↓
+Customer uses API with their key
+
+    ↓ later...
+
+Customer cancels subscription
+    ↓
+Stripe fires customer.subscription.deleted
+    ↓
+Workflow API: schedule revocation (48h grace)
+    ↓
+48h later → key automatically revoked 🔒
+```
+
+**Manual flow:**
+
+```
+Creator runs: python3 cli.py keys create --name Pro --rate-limit 200
+    ↓
+Key printed once. Creator copies and sends to user.
     ↓
 User calls the API with their key.
     ↓
-User cancels subscription
-    ↓
-Creator runs: python cli.py keys revoke Pro
+Creator runs: python3 cli.py keys revoke Pro
     ↓
 Key is immediately invalidated.
 ```
 
-The rate limit IS the tier. Free = 10 req/min. Pro = 200. Enterprise = unlimited.
-
-The logs track which tier made each request, giving the creator usage data per customer without building any analytics infrastructure.
+The rate limit IS the tier. Free = 10 req/min. Pro = 200. Enterprise = unlimited (0).
 
 ---
 
@@ -267,11 +323,14 @@ The logs track which tier made each request, giving the creator usage data per c
 |---|---|---|
 | API server | FastAPI + uvicorn | async, fast, auto docs at /docs |
 | HTTP forwarding | httpx | async, clean API, good error handling |
-| Config | PyYAML | human-readable, no database needed |
+| Config | PyYAML | human-readable, no database needed for dev |
+| Storage (prod) | SQLite (stdlib) | WAL mode, zero dependencies, multi-worker safe |
 | CLI | Click | subcommand groups, clean argument parsing |
 | Terminal output | Rich | tables, panels, color without complexity |
-| Auth | Python secrets | timing-attack-safe comparison |
+| Auth | hashlib + secrets | SHA-256 hashing, timing-attack-safe comparison |
+| Stripe | stripe-python | Official SDK, HMAC `Webhook.construct_event` |
 | Rate limiting | Custom token bucket | no Redis dependency, per-key capacity |
+| Email | smtplib + Jinja2 | stdlib, no external email service required |
 | Containerization | Docker | one command to run on any VPS |
 
 ---
@@ -280,31 +339,49 @@ The logs track which tier made each request, giving the creator usage data per c
 
 These are conscious non-decisions, not missing features:
 
-- **No billing integration** — Workflow API doesn't touch money. The creator handles that externally.
-- **No dashboard UI** — the CLI is the UI. A web dashboard adds complexity and a server dependency.
+- **No public portal** — removed in V2 for security. Operators build their own customer-facing UI using the `/stats` JSON endpoint.
+- **No billing integration** — Workflow API doesn't touch money. The creator configures Stripe externally.
 - **No workflow execution** — Workflow API only proxies. It never runs n8n, Zapier, or Python code itself.
-- **No database** — `config.yaml` and flat log files are intentionally sufficient for the v1 scope.
-- **No multi-user admin** — one operator per deployment. Not a SaaS platform.
 - **No request transformation** — body goes in, body comes out. Schema enforcement is the workflow's job.
+- **No multi-user admin** — one operator per deployment. Not a SaaS platform.
+- **No external database required** — SQLite (stdlib) handles everything. Postgres/MySQL is for your n8n workflows, not Workflow API.
 
 ---
 
-## 9. Deployment
+## 9. Security Architecture
+
+| Layer | Mechanism |
+|---|---|
+| Webhook integrity | HMAC via `stripe.Webhook.construct_event` — 401 on mismatch, 503 if secret missing |
+| Key storage | SHA-256 hash only — raw key shown once, never recoverable |
+| Secret management | `STRIPE_WEBHOOK_SECRET`, `SMTP_PASSWORD`, `WORKFLOW_API_ADMIN_KEY` — env vars only |
+| Admin auth | `secrets.compare_digest` — prevents timing attacks |
+| SSRF protection | Target URL validated at startup — localhost, RFC1918, cloud metadata blocked |
+| Event deduplication | Stripe `event.id` tracked in DB — prevents double provisioning on retries |
+| Persistent grace period | Cancellations stored in DB — survives restarts, multi-worker safe |
+| Gitignore | `config.yaml`, `*.db`, `*.lock`, `logs/`, `.env*`, `site/` — nothing sensitive committed |
+
+---
+
+## 10. Deployment
 
 ### Local (development)
 
 ```bash
-python cli.py init
-python cli.py start
+python3 cli.py init
+python3 cli.py start
 ```
 
-### VPS / live server
+### VPS / live server (Docker)
 
 ```bash
 docker build -t workflow-api .
 docker run -d \
   -p 8000:8000 \
+  -e WORKFLOW_API_ADMIN_KEY="change-this-admin-secret" \
+  -e STRIPE_WEBHOOK_SECRET="whsec_..." \
   -v $(pwd)/config.yaml:/app/config.yaml \
+  -v $(pwd)/workflow-api.db:/app/workflow-api.db \
   -v $(pwd)/logs:/app/logs \
   --name workflow-api \
   workflow-api
@@ -312,133 +389,58 @@ docker run -d \
 
 Works on any Ubuntu VPS, DigitalOcean Droplet, Hetzner server, Raspberry Pi, or home server.
 
----
+### Cloud PaaS (Render / Railway)
 
-## 10. Future Improvements
-
-Roughly ordered by impact and buildability.
-
-### 10.1 Usage stats endpoint (high priority, easy)
-
-A `/stats` endpoint that reads `usage.log` and returns per-tier usage counts, total requests, error rates, and average latency. No new dependencies — just aggregate the existing log file.
-
-```json
-{
-  "total_requests": 1420,
-  "by_tier": {
-    "Free": { "requests": 340, "errors": 12 },
-    "Pro": { "requests": 1080, "errors": 3 }
-  },
-  "avg_latency_ms": 187
-}
-```
-
-### 10.2 Key expiry (high priority, easy)
-
-Add an `expires_at` field to each key record. The auth layer checks the date on every request and returns `401` with `"error": "Key expired"` if past expiry. The CLI gets an `--expires` flag:
-
-```bash
-python cli.py keys create --name "Trial" --rate-limit 20 --expires 2026-05-01
-```
-
-### 10.3 Per-workflow key scoping (medium priority, medium effort)
-
-Currently a key grants access to all workflows. Add an optional `workflows` list to each key record:
-
-```yaml
-keys:
-  - name: Free
-    key: wfapi-xxx
-    rate_limit_per_minute: 10
-    workflows: [summarize]     # can only call /run/summarize
-```
-
-If `workflows` is absent, the key has access to everything (current behaviour, backwards compatible).
-
-### 10.4 Webhook on usage events (medium priority, medium effort)
-
-An optional `on_request` webhook in config that Workflow API pings after every successful request:
-
-```yaml
-hooks:
-  on_request: https://your-server.com/usage-event
-```
-
-Payload: `{tier, endpoint, timestamp, latency_ms}`. This lets the creator pipe usage data into Stripe metered billing, their own database, or Slack without any changes to Workflow API itself.
-
-### 10.5 `cli.py logs` command (low priority, easy)
-
-A CLI command to tail and filter the log file:
-
-```bash
-python cli.py logs                  # last 20 requests
-python cli.py logs --tier Pro       # filter by tier
-python cli.py logs --errors         # only 4xx / 5xx
-python cli.py logs --follow         # live tail
-```
-
-### 10.6 Multiple workflows per key with different rate limits (medium priority, hard)
-
-Currently rate limiting is per-key, globally. A more granular model would allow:
-
-```yaml
-keys:
-  - name: Pro
-    rate_limits:
-      /run/summarize: 200
-      /run/translate: 50
-```
-
-Requires restructuring the limiter to bucket on `(key, endpoint)` pairs.
-
-### 10.7 Admin API (low priority, medium effort)
-
-A `/admin` set of endpoints protected by a separate master key, allowing key management over HTTP instead of CLI:
-
-```
-POST   /admin/keys          create key
-GET    /admin/keys          list keys
-DELETE /admin/keys/{name}   revoke key
-GET    /admin/stats         usage stats
-```
-
-This would allow building a web dashboard or integrating key management into a Stripe webhook handler.
-
-### 10.8 n8n / Zapier native adapters (low priority, hard)
-
-Currently Workflow API works with n8n and Zapier because they both expose webhook URLs. A deeper integration would involve:
-
-- Auto-detecting n8n workflows via the n8n API
-- Listing available webhooks and letting the user pick one during `init`
-- Removing the need to copy-paste webhook URLs manually
-
-This is a significant scope increase and only makes sense after the core tool is stable and has users.
-
-### 10.9 SQLite backend (optional, future)
-
-Replace `config.yaml` + flat log file with SQLite when the log file grows large or multi-operator support is needed. The swap should be invisible to the CLI user. This is not needed until someone has enough users to produce millions of log lines.
+1. Push to a private GitHub repo.
+2. Connect to Render or Railway as a new Web Service.
+3. Set `WORKFLOW_API_ADMIN_KEY` and `STRIPE_WEBHOOK_SECRET` as environment variables.
+4. Attach a Persistent Disk to `/app/workflow-api.db` so key data survives redeploys.
 
 ---
 
-## 11. Known Limitations (v1)
+## 11. Known Limitations (V2)
 
-- **Keys stored in plaintext** in `config.yaml`. For high-security deployments, the user should encrypt the config file or use filesystem permissions.
-- **No key rotation** — revoking and recreating a key requires sending the new key to the user manually.
-- **Single process** — uvicorn runs as a single worker. For high-concurrency deployments, run behind Gunicorn with multiple workers.
-- **Log file grows unbounded** — no rotation implemented. For long-running deployments, set up `logrotate` on the OS level.
-- **Restart required for config changes** — workflows added after startup are not picked up until `python cli.py start` is run again.
+- **Log file grows unbounded** — no rotation implemented. For long-running deployments, configure `logrotate` at the OS level.
+- **Rate limiter is in-memory** — in multi-worker mode, each worker has its own token bucket. For globally accurate rate limiting across workers, a shared backend (e.g. Redis) would be needed. For most use cases this is acceptable.
+- **Restart required for workflow config changes** — workflows added after startup are not picked up until the server restarts.
+- **No key rotation** — revoking and recreating a key requires sending the new key to the user manually (or via Stripe automation).
 
 ---
 
-## 12. Summary
+## 12. Future Improvements
+
+### 12.1 Redis-backed global rate limiter (medium priority)
+Replace per-worker in-memory token buckets with Redis so rate limits are globally accurate across all uvicorn workers. Zero API surface change — just swap the limiter backend.
+
+### 12.2 Webhook on usage events (medium priority)
+An optional `on_request` hook in config that Workflow API pings after every successful request, enabling pipe-through to Stripe metered billing, Slack, or a custom analytics endpoint.
+
+### 12.3 Admin REST API (low priority)
+A `/admin/*` set of endpoints protected by the admin key, allowing key management over HTTP instead of CLI. This would enable integrating key management into third-party dashboards or custom portals.
+
+### 12.4 Per-workflow rate limits (medium priority, harder)
+Currently rate limiting is per-key globally. A more granular model would allow different limits per (key, endpoint) pair — e.g., 200 RPM for `/run/summarize` and 50 RPM for `/run/translate` on the same key.
+
+### 12.5 n8n native adapter (low priority)
+Auto-detect n8n workflows via the n8n API so users don't need to copy-paste webhook URLs during setup. Significant scope increase — only relevant after the tool has a user base.
+
+---
+
+## 13. Summary
 
 Workflow API is a single-operator, self-hosted API gateway designed for workflow creators who want to monetize access to their automations without infrastructure complexity.
 
-The core insight is that the gap between "I built a workflow" and "I can sell API access to it" is entirely an auth + rate limiting problem. Workflow API solves exactly that, nothing more, and stays out of the way of everything else.
+The core insight is that the gap between "I built a workflow" and "I can sell API access to it" is entirely an auth + rate limiting + billing automation problem. Workflow API solves exactly that, nothing more, and stays out of the way of everything else.
 
-The entire system is under 500 lines of Python across 6 files, ships in a single Docker container, requires no database, and can be set up in under 5 minutes by a non-technical user.
+**V2 production hardening adds:**
+- SHA-256 key hashing (plaintext keys removed)
+- HMAC Stripe webhook signature verification
+- Persistent 48-hour cancellation grace period (DB-backed, multi-worker safe)
+- Dual storage backends with migration tooling
+- SSRF protection on all target URLs
+- Clean gitignore covering all secrets and runtime state
 
 ---
 
-*Built with FastAPI, httpx, Click, Rich, PyYAML.*
+*Built with FastAPI, httpx, Click, Rich, PyYAML, SQLite, stripe-python.*
 *License: MIT*

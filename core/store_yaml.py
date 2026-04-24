@@ -16,6 +16,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 STRIPE_EVENTS_PATH = PROJECT_ROOT / "logs" / "stripe_events.json"
 COOLDOWN_PATH = PROJECT_ROOT / "resend_cooldown.json"
+PENDING_CANCELLATIONS_PATH = PROJECT_ROOT / "logs" / "pending_cancellations.json"
 MAX_STRIPE_EVENTS = 1000
 _LOCK_PATH = PROJECT_ROOT / "config.yaml.lock"
 
@@ -202,3 +203,57 @@ class YAMLKeyStore:
 
         _with_exclusive_lock(_do)
         return (result[0], result[1])
+
+    # ── Pending cancellations (persistent grace period, file-locked) ──────────
+
+    def _load_pending_cancellations(self) -> dict:
+        """Load pending cancellations from JSON file. Returns {sub_id: {revoke_at, created_at}}."""
+        if not PENDING_CANCELLATIONS_PATH.exists():
+            return {}
+        try:
+            with open(PENDING_CANCELLATIONS_PATH, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_pending_cancellations(self, data: dict) -> None:
+        PENDING_CANCELLATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(PENDING_CANCELLATIONS_PATH, "w") as f:
+            json.dump(data, f)
+
+    def add_pending_cancellation(self, subscription_id: str, revoke_at: str) -> None:
+        from datetime import datetime, timezone
+        def _do():
+            data = self._load_pending_cancellations()
+            data[subscription_id] = {
+                "revoke_at": revoke_at,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_pending_cancellations(data)
+        _with_exclusive_lock(_do)
+
+    def remove_pending_cancellation(self, subscription_id: str) -> bool:
+        removed = [False]
+        def _do():
+            data = self._load_pending_cancellations()
+            if subscription_id in data:
+                del data[subscription_id]
+                self._save_pending_cancellations(data)
+                removed[0] = True
+        _with_exclusive_lock(_do)
+        return removed[0]
+
+    def get_due_cancellations(self) -> list[dict]:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        data = self._load_pending_cancellations()
+        due = []
+        for sub_id, info in data.items():
+            if info.get("revoke_at", "") <= now:
+                due.append({
+                    "subscription_id": sub_id,
+                    "revoke_at": info["revoke_at"],
+                    "created_at": info.get("created_at", ""),
+                })
+        return due
+

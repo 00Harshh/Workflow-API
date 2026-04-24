@@ -18,6 +18,8 @@ Workflow API is a small self-hosted gateway for n8n, Zapier, custom scripts, or 
 - JSON access logs
 - Usage stats and a read-only dashboard
 - Optional Stripe webhook automation for subscription-based key creation and revocation
+- 48-hour grace period on subscription cancellation with automatic reactivation
+- HMAC webhook signature verification on all Stripe events
 
 Workflow API does not run your workflow, process payments, or require a database. Everything lives in `config.yaml` and `logs/`.
 
@@ -400,25 +402,102 @@ Stripe automation lets Workflow API create and revoke API keys from subscription
 
 What it does:
 
-- `checkout.session.completed` creates a new Workflow API key
+- `checkout.session.completed` creates a new scoped, rate-limited API key and emails it to the customer
 - The key scope comes from the Stripe Price ID mapping
-- The key gets `stripe_subscription_id`
-- `customer.subscription.deleted` removes the matching key
-- Duplicate Stripe events are ignored
+- The key gets `stripe_subscription_id` for lifecycle tracking
+- `customer.subscription.deleted` schedules key revocation after a **48-hour grace period**
+- `customer.subscription.created` or `invoice.payment_succeeded` cancels a pending revocation and keeps the key active
+- Duplicate Stripe events are deduplicated and ignored
+- Every incoming webhook is verified via **HMAC signature validation** before any business logic runs
 
 What it does not do:
 
-- Workflow API does not email the key to the customer
 - Workflow API does not manage Stripe products or prices
 - Workflow API does not expose the generated key in the webhook response
 
-### 9.1 Configure Stripe
+### 9.1 HMAC Webhook Signature Verification
 
-Edit `config.yaml`:
+Every request to `/webhooks/stripe` is verified using Stripe's `Stripe-Signature` header before any business logic executes. This prevents forged or tampered webhook payloads from reaching your system.
+
+**How it works:**
+
+```text
+Stripe sends POST /webhooks/stripe
+  → Read raw body + Stripe-Signature header
+  → stripe.Webhook.construct_event(body, signature, secret)
+  → HMAC mismatch? → 401 Unauthorized (request rejected)
+  → Signature valid? → proceed to process event
+```
+
+**Configuration:**
+
+The webhook signing secret is loaded **exclusively** from the `STRIPE_WEBHOOK_SECRET` environment variable. It is never read from `config.yaml` to prevent accidental leakage into version control.
+
+```bash
+export STRIPE_WEBHOOK_SECRET="whsec_your_webhook_secret"
+```
+
+Get this value from:
+- **Stripe Dashboard:** Developers → Webhooks → your endpoint → Signing secret
+- **Stripe CLI (local testing):** `stripe listen --forward-to localhost:8000/webhooks/stripe` prints it
+
+If `STRIPE_WEBHOOK_SECRET` is not set, the endpoint returns `503` and all webhooks are rejected.
+
+### 9.2 Cancellation Grace Period (48 Hours)
+
+When a customer cancels their subscription, Workflow API does **not** revoke the API key immediately. Instead, it schedules revocation after a 48-hour grace period. If the customer resubscribes or pays an outstanding invoice within that window, the pending revocation is cancelled and the key stays active.
+
+**Flow:**
+
+```text
+Stripe fires customer.subscription.deleted
+  → Workflow API writes a pending_cancellation record to the database
+  → Key stays ACTIVE for 48 hours
+
+Case A: Customer resubscribes within 48h
+  → Stripe fires customer.subscription.created or invoice.payment_succeeded
+  → Workflow API deletes the pending_cancellation record
+  → Key remains active ✅
+
+Case B: 48 hours pass without reactivation
+  → Background poller detects the due cancellation
+  → Key is revoked 🔒
+```
+
+The grace period is **persistent** — it survives server restarts and works correctly across multiple workers because the state is stored in the database (SQLite table or YAML JSON file), not in memory.
+
+**Configuration:**
+
+```bash
+# Override the default 48-hour grace period (value in seconds)
+export CANCELLATION_GRACE_SECONDS=172800
+
+# Override how often the poller checks for due revocations (default: 60s)
+export CANCELLATION_POLL_SECONDS=60
+```
+
+### 9.3 Stripe Events Handled
+
+| Stripe Event | Action |
+|---|---|
+| `checkout.session.completed` | Create API key, map Price ID to gateway scope, email key to customer |
+| `customer.subscription.deleted` | Schedule key revocation after 48h grace period |
+| `customer.subscription.created` | Cancel pending revocation if one exists for this subscription |
+| `invoice.payment_succeeded` | Cancel pending revocation if one exists for this subscription |
+| Any other event | Acknowledged but ignored |
+
+### 9.4 Configure Stripe
+
+Set environment variables for secrets:
+
+```bash
+export STRIPE_WEBHOOK_SECRET="whsec_your_webhook_secret"
+```
+
+Edit `config.yaml` for non-secret settings:
 
 ```yaml
 stripe:
-  webhook_secret: "whsec_your_webhook_secret"
   api_key: "sk_live_or_test_key"
   rate_limit_per_minute: 100
   price_to_gateway:
@@ -428,12 +507,11 @@ stripe:
 
 Notes:
 
-- `webhook_secret` comes from the Stripe webhook endpoint settings.
 - `api_key` is used to fetch checkout line items when Stripe does not include them in the event payload.
 - `price_to_gateway` maps Stripe Price IDs to Workflow API workflow names.
 - `rate_limit_per_minute` is optional and defaults to `60` for Stripe-created keys.
 
-### 9.2 Add The Stripe Webhook Endpoint
+### 9.5 Add The Stripe Webhook Endpoint
 
 In Stripe, set your webhook endpoint URL to:
 
@@ -446,6 +524,8 @@ Select these events:
 ```text
 checkout.session.completed
 customer.subscription.deleted
+customer.subscription.created
+invoice.payment_succeeded
 ```
 
 For local testing with Stripe CLI:
@@ -454,13 +534,18 @@ For local testing with Stripe CLI:
 stripe listen --forward-to localhost:8000/webhooks/stripe
 ```
 
-Copy the `whsec_...` secret printed by Stripe CLI into `config.yaml`.
+Copy the `whsec_...` secret printed by Stripe CLI into your environment:
 
-### 9.3 Test Stripe Locally
+```bash
+export STRIPE_WEBHOOK_SECRET="whsec_..."
+```
+
+### 9.6 Test Stripe Locally
 
 Start Workflow API:
 
 ```bash
+export STRIPE_WEBHOOK_SECRET="whsec_from_stripe_listen"
 workflow-api start
 ```
 
@@ -470,7 +555,7 @@ In another terminal:
 stripe trigger checkout.session.completed
 ```
 
-Then check `config.yaml`. A new key should appear with:
+Then check your database. A new key should appear with:
 
 ```yaml
 allowed_gateways:
@@ -478,15 +563,15 @@ allowed_gateways:
 stripe_subscription_id: sub_...
 ```
 
-Trigger deletion:
+Trigger deletion (with grace period):
 
 ```bash
 stripe trigger customer.subscription.deleted
 ```
 
-The matching key should be removed.
+The key will be marked as pending cancellation. It will be revoked after 48 hours unless a reactivation event arrives.
 
-Important: Stripe's default trigger payload may use a test Price ID that is not in your `price_to_gateway` mapping. If no key is created, check `workflow-api logs` for an `stripe_price_unmapped` warning and add the test Price ID to the mapping.
+Important: Stripe's default trigger payload may use a test Price ID that is not in your `price_to_gateway` mapping. If no key is created, check `workflow-api logs` for a `stripe_price_unmapped` warning and add the test Price ID to the mapping.
 
 ---
 
@@ -562,14 +647,33 @@ tail -f logs/usage.log
 
 Before exposing Workflow API publicly:
 
+**Security:**
+
 - Put Workflow API behind HTTPS, for example Caddy, Nginx, Traefik, or a cloud load balancer.
-- Set `WORKFLOW_API_ADMIN_KEY` or `admin.api_key`.
-- Keep `config.yaml` private because it contains API keys.
-- Use filesystem permissions so only the Workflow API user can read `config.yaml`.
-- Back up `config.yaml`.
-- Mount `logs/` as a persistent volume if using Docker.
-- Configure log rotation for long-running deployments.
+- Set `WORKFLOW_API_ADMIN_KEY` as an environment variable.
+- Set `STRIPE_WEBHOOK_SECRET` as an environment variable (never in `config.yaml`).
+- Keep `config.yaml` private because it contains API key hashes.
+- Use filesystem permissions so only the Workflow API user can read `config.yaml` and `workflow-api.db`.
 - Use Stripe test mode before switching to live mode.
+
+**Persistence:**
+
+- Back up `config.yaml` and/or `workflow-api.db`.
+- Mount `logs/` and `workflow-api.db` as persistent volumes if using Docker.
+- Configure log rotation for long-running deployments.
+
+**Required environment variables:**
+
+```bash
+export WORKFLOW_API_ADMIN_KEY="your-admin-secret"
+export STRIPE_WEBHOOK_SECRET="whsec_your_webhook_secret"
+
+# Optional overrides
+export CANCELLATION_GRACE_SECONDS=172800   # default: 48 hours
+export CANCELLATION_POLL_SECONDS=60        # default: 60s
+export SMTP_HOST="smtp.gmail.com"
+export SMTP_PASSWORD="your-app-password"
+```
 
 ---
 
@@ -609,9 +713,15 @@ The key has used its per-minute allowance. Create a higher-tier key or wait for 
 
 Workflow API is running, but your target workflow URL is not reachable. Check that n8n, Zapier, or your app is running and that the target URL in `config.yaml` is correct.
 
+`Stripe webhook returns 401`
+
+The `Stripe-Signature` header failed HMAC verification. This means either:
+- The `STRIPE_WEBHOOK_SECRET` env var does not match the secret for your Stripe webhook endpoint.
+- The request was not sent by Stripe (forged payload).
+
 `Stripe webhook returns 503`
 
-`stripe.webhook_secret` is missing from `config.yaml`.
+`STRIPE_WEBHOOK_SECRET` environment variable is not set. Set it and restart.
 
 `Stripe webhook succeeds but no key appears`
 
@@ -619,9 +729,13 @@ Check:
 
 - The event is `checkout.session.completed`.
 - The Checkout Session has a subscription ID.
-- The Stripe Price ID exists in `stripe.price_to_gateway`.
+- The Stripe Price ID exists in `stripe.price_to_gateway` in `config.yaml`.
 - The mapped gateway names exist in `workflows:` or `gateways:`.
 - `workflow-api logs` for `stripe_price_unmapped` or `stripe_scope_invalid`.
+
+`Key not revoked after subscription cancellation`
+
+Key revocation has a 48-hour grace period by default. The key will be revoked automatically after the grace window expires. Check `workflow-api logs` for `cancellation_scheduled` to confirm the pending revocation was recorded.
 
 ---
 
@@ -657,22 +771,46 @@ python3 cli.py key list
 
 ```text
 workflow-api/
-  cli.py
-  main.py
-  config.yaml
+  cli.py                          # CLI: start, keys, migrate, n8n commands
+  main.py                         # FastAPI app: routes, lifespan, webhook handler
+  config.yaml                     # Master config (gitignored — use config.example.yaml)
   core/
-    auth.py
-    limiter.py
-    logger.py
-    proxy.py
-    stripe_webhooks.py
+    auth.py                       # Key hashing, validation, create/revoke
+    cancellation_scheduler.py     # Persistent 48h grace period poller
+    email_sender.py               # SMTP email delivery with HTML template
+    limiter.py                    # In-memory token bucket rate limiter
+    logger.py                     # Async log queue — never blocks the event loop
+    proxy.py                      # httpx async request forwarder
+    security.py                   # SSRF protection, IP extraction
+    store.py                      # KeyStore protocol + singleton factory
+    store_sqlite.py               # SQLite backend (WAL mode, production)
+    store_yaml.py                 # YAML backend (file locking, dev)
+    stripe_webhooks.py            # Stripe event processing + HMAC verification
   templates/
-    dashboard.html
+    dashboard.html                # Admin dashboard (Chart.js)
   logs/
-    usage.log
+    usage.log                     # Structured JSON access log
+  nginx.conf                      # Drop-in nginx reverse proxy config
   Dockerfile
   requirements.txt
 ```
+
+---
+
+## Security
+
+Workflow API includes the following security measures:
+
+| Feature | Description |
+|---------|-------------|
+| **SHA-256 key hashing** | API keys are hashed before storage. Raw keys are shown once at creation and cannot be recovered. |
+| **HMAC webhook verification** | Every Stripe webhook is verified via `Stripe-Signature` header before any business logic runs. Failures return `401`. |
+| **Env-only secrets** | The Stripe webhook secret (`STRIPE_WEBHOOK_SECRET`) is loaded exclusively from environment variables, never from config files. |
+| **Scrubbed error responses** | Internal errors on the webhook endpoint return generic messages. Exception details are logged internally only. |
+| **SSRF protection** | Target workflow URLs are validated at startup. Requests to localhost, private IPs, and cloud metadata endpoints are blocked. |
+| **Constant-time admin auth** | Admin key comparison uses `secrets.compare_digest` to prevent timing attacks. |
+| **Persistent grace period** | Pending cancellations are stored in the database (not memory), surviving restarts and working across multiple workers. |
+| **Gitignore coverage** | `config.yaml`, database files, state files (`pending_cancellations.json`, `resend_cooldown.json`), and logs are all gitignored. |
 
 ---
 

@@ -22,7 +22,9 @@ workflow-api.db-shm
 # ── Logs ──────────────────────────────────────────────────
 logs/usage.log
 logs/stripe_events.json
+logs/pending_cancellations.json
 logs/*.log
+resend_cooldown.json
 
 # ── OS / IDE ──────────────────────────────────────────────
 .DS_Store
@@ -30,3 +32,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ── Landing page (hosted separately) ─────────────────────
+site/
+
+# ── Test artifacts ────────────────────────────────────────
+_test_*

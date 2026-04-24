@@ -141,7 +141,7 @@ def _print_next_steps(endpoint: str, key: str, port: int):
         f"   [cyan]curl -X POST http://localhost:{port}{endpoint} \\\\[/cyan]\n"
         f"   [cyan]  -H \"Authorization: Bearer {key}\" \\\\[/cyan]\n"
         f"   [cyan]  -H \"Content-Type: application/json\" \\\\[/cyan]\n"
-        f"   [cyan]  -d '{{\"name\":\"Harsh\",\"test\":true}}'[/cyan]",
+        f"   [cyan]  -d '{{\"name\":\"Alice\",\"test\":true}}'[/cyan]",
         border_style="green",
         expand=False,
     ))

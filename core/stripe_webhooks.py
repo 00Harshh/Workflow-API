@@ -2,11 +2,18 @@
 core/stripe_webhooks.py — Stripe webhook event processing.
 
 Handles:
-  checkout.session.completed      → create API key, send email to customer
-  customer.subscription.deleted   → revoke API key
+  checkout.session.completed        → create API key, send email to customer
+  customer.subscription.deleted     → schedule key revocation (48h grace period)
+  customer.subscription.created     → cancel pending revocation, reactivate key
+  invoice.payment_succeeded         → cancel pending revocation, reactivate key
+
+Signature verification:
+  HMAC validation via stripe.Webhook.construct_event using the secret from
+  env var STRIPE_WEBHOOK_SECRET (required — never read from config.yaml).
 """
 from __future__ import annotations
 
+import os
 import re
 
 import stripe
@@ -17,6 +24,10 @@ from core.auth import (
     get_gateway_names,
     load_config,
     revoke_key_by_stripe_subscription,
+)
+from core.cancellation_scheduler import (
+    cancel_pending_revocation,
+    schedule_revocation,
 )
 from core.logger import log_request
 
@@ -58,13 +69,27 @@ def mark_event_processed(event_id: str | None) -> None:
     get_store().mark_stripe_event_processed(event_id)
 
 
-# ── Webhook signature verification ───────────────────────────────────────────
+# ── Webhook signature verification (HMAC) ───────────────────────────────────
 
 def construct_event(payload: bytes, signature: str | None):
-    stripe_cfg = _stripe_config()
-    webhook_secret = stripe_cfg.get("webhook_secret")
+    """
+    Verify Stripe-Signature header and construct the event object.
+
+    The webhook secret is loaded EXCLUSIVELY from the STRIPE_WEBHOOK_SECRET
+    env var.  It is never read from config.yaml to prevent accidental
+    secret leakage into version control.
+
+    Raises:
+      StripeWebhookConfigError   — env var not set
+      ValueError                 — malformed payload
+      stripe.error.SignatureVerificationError — HMAC mismatch (→ 401)
+    """
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
     if not webhook_secret:
-        raise StripeWebhookConfigError("Stripe webhook_secret is not configured.")
+        raise StripeWebhookConfigError(
+            "STRIPE_WEBHOOK_SECRET env var is not set. "
+            "Stripe webhooks are disabled until it is configured."
+        )
     return stripe.Webhook.construct_event(payload, signature, webhook_secret)
 
 
@@ -207,28 +232,58 @@ async def _create_key_for_checkout_session(session, event_id: str | None) -> dic
     return {"action": "created", "subscription_id": subscription_id, "event_id": event_id}
 
 
-# ── Subscription deleted → revoke key ────────────────────────────────────────
+# ── Subscription deleted → schedule revocation (48h grace) ───────────────────
 
-def _revoke_key_for_deleted_subscription(subscription, event_id: str | None) -> dict:
+def _schedule_revocation_for_deleted_subscription(subscription, event_id: str | None) -> dict:
+    """
+    Instead of revoking immediately, schedule revocation after a 48-hour
+    grace period. The key stays active during the window — if the customer
+    resubscribes or pays an outstanding invoice, the revocation is cancelled.
+    """
     subscription_id = _object_get(subscription, "id")
     if not subscription_id:
         return {"action": "skipped", "reason": "missing_subscription_id"}
 
-    revoked = revoke_key_by_stripe_subscription(subscription_id)
-    log_request(
-        "/webhooks/stripe", 200, 0,
-        gateway="stripe",
-        event="stripe_key_revoked" if revoked else "stripe_key_revoke_miss",
-        level="INFO" if revoked else "WARNING",
+    result = schedule_revocation(subscription_id)
+    return {**result, "event_id": event_id}
+
+
+# ── Reactivation events → cancel pending revocation ──────────────────────────
+
+def _handle_reactivation_event(event_object, event_id: str | None, event_type: str) -> dict:
+    """
+    Called on customer.subscription.created and invoice.payment_succeeded.
+    If the same subscription has a pending revocation, cancel it.
+    """
+    subscription_id = (
+        _object_get(event_object, "id")                  # subscription.created
+        or _object_get(event_object, "subscription")     # invoice.payment_succeeded
     )
+    if not subscription_id:
+        return {"action": "skipped", "reason": "missing_subscription_id"}
+
+    cancelled = cancel_pending_revocation(subscription_id)
+    if cancelled:
+        log_request(
+            "/webhooks/stripe", 200, 0,
+            gateway="stripe",
+            event=f"reactivated_via_{event_type.replace('.', '_')}",
+            level="INFO",
+        )
     return {
-        "action": "revoked" if revoked else "not_found",
+        "action": "reactivated" if cancelled else "no_pending_cancellation",
         "subscription_id": subscription_id,
         "event_id": event_id,
     }
 
 
 # ── Main dispatcher ───────────────────────────────────────────────────────────
+
+_REACTIVATION_EVENTS = frozenset({
+    "customer.subscription.created",
+    "invoice.payment_succeeded",
+})
+
 
 async def process_event(event) -> dict:
     event_id = _object_get(event, "id")
@@ -242,7 +297,9 @@ async def process_event(event) -> dict:
     if event_type == "checkout.session.completed":
         result = await _create_key_for_checkout_session(event_object, event_id)
     elif event_type == "customer.subscription.deleted":
-        result = _revoke_key_for_deleted_subscription(event_object, event_id)
+        result = _schedule_revocation_for_deleted_subscription(event_object, event_id)
+    elif event_type in _REACTIVATION_EVENTS:
+        result = _handle_reactivation_event(event_object, event_id, event_type)
     else:
         result = {"action": "ignored", "event_type": event_type}
 

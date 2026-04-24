@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS resend_cooldown (
     last_resend REAL    NOT NULL
 );
 
+-- Persistent grace period: pending subscription cancellations
+CREATE TABLE IF NOT EXISTS pending_cancellations (
+    subscription_id TEXT    PRIMARY KEY,
+    revoke_at       TEXT    NOT NULL,   -- ISO 8601 UTC timestamp
+    created_at      TEXT    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_keys_hash  ON keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_keys_sub   ON keys (stripe_subscription_id);
 CREATE INDEX IF NOT EXISTS idx_keys_email ON keys (email);
@@ -235,3 +242,36 @@ class SQLiteKeyStore:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    # ── Pending cancellations (persistent grace period) ───────────────────────
+
+    def add_pending_cancellation(self, subscription_id: str, revoke_at: str) -> None:
+        """Insert or update a pending cancellation record."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_cancellations "
+            "(subscription_id, revoke_at, created_at) VALUES (?, ?, ?)",
+            (subscription_id, revoke_at, now),
+        )
+        conn.commit()
+
+    def remove_pending_cancellation(self, subscription_id: str) -> bool:
+        """Remove a pending cancellation (customer reactivated). Returns True if deleted."""
+        conn = self._conn()
+        cur = conn.execute(
+            "DELETE FROM pending_cancellations WHERE subscription_id = ?",
+            (subscription_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    def get_due_cancellations(self) -> list[dict]:
+        """Return all pending cancellations whose revoke_at is in the past."""
+        now = datetime.now(timezone.utc).isoformat()
+        rows = self._conn().execute(
+            "SELECT subscription_id, revoke_at, created_at "
+            "FROM pending_cancellations WHERE revoke_at <= ?",
+            (now,),
+        ).fetchall()
+        return [dict(r) for r in rows]

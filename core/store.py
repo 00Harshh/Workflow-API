@@ -38,6 +38,17 @@ class KeyStore(Protocol):
     Cross-worker safe: YAML uses file locking, SQLite uses a DB table.
     """
 
+    # ── Pending cancellation persistence (grace period) ───────────────────
+    def add_pending_cancellation(self, subscription_id: str, revoke_at: str) -> None:
+        """Record a pending cancellation with an ISO 8601 UTC revoke_at timestamp."""
+        ...
+    def remove_pending_cancellation(self, subscription_id: str) -> bool:
+        """Remove a pending cancellation (reactivated). Returns True if one was removed."""
+        ...
+    def get_due_cancellations(self) -> list[dict]:
+        """Return all pending cancellations where revoke_at <= now."""
+        ...
+
 
 _store: KeyStore | None = None
 
